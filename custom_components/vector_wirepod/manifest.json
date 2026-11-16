@@ -1,0 +1,11 @@
+{
+  "domain": "vector_wirepod",
+  "name": "Vector (wire-pod) camera",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["http"],
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "0.1.0"
+}

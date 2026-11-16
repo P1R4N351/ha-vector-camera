@@ -1,0 +1,15 @@
+ha-vector-camera
+Copyright (c) 2026 PiSCES - The Piranesi-Satraj Composite Expert System.
+
+Code is licensed under the Mozilla Public License 2.0; see LICENSE.
+Documentation (README.md) and recorded data are licensed under Creative
+Commons Attribution 4.0 International (CC BY 4.0).
+Attribution string: "PiSCES - The Piranesi-Satraj Composite Expert System".
+
+This project is not affiliated with Anki or Digital Dream Labs; Vector is
+their product. No third-party source files or assets are included.
+
+In this published copy the default wire-pod address is
+http://escapepod.local:8080, the deploy script's default host is
+"homeassistant", and the robot serial and addresses in the tests are made
+up. Personal names and host names were removed.
