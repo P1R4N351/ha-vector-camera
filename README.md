@@ -15,7 +15,7 @@ measured against live wire-pod and Home Assistant hosts.
 
 | Rule | Why |
 |---|---|
-| Only `get_sdk_info`, `get_battery` and `/cam-stream` are ever requested; a test fails if any other wire-pod path appears in the source. | No behaviour control, motion, speech, eye colour, wake word or event stream. Nothing here can wake the robot or take it from what it is doing. |
+| Only `get_sdk_info`, `get_battery`, `quiet_mode` (when toggled or polled), and `/cam-stream` are ever requested; a test fails if any other wire-pod path appears in the source. | Passive by default: polling never wakes, drives, or interrupts the robot. Enabling `Quiet mode` asks wire-pod's persistent supervisor to hold `RESERVE_CONTROL` and mute audio to suppress autonomous roaming, expressions, and wake-word reactions while leaving emergency cliff/low-battery safety active. |
 | All HA viewers share one `/cam-stream` connection, opened only while someone watches live and closed when the last viewer leaves (returning camera state to `idle`). | wire-pod serves one viewer per robot and ends the previous one when a new one arrives. |
 | A start that yields no frame within 6 s is abandoned, then retried no sooner than 60 s later, doubling to 30 min. Waiting live streams keep a calm 5 s status keepalive instead of disconnecting and auto-recover when frames arrive. | An unpatched wire-pod waits on a robot that is not producing frames with no deadline, and browser reconnect storms otherwise hammer wire-pod. |
 | JPEG frames are bounded by walking ISO 10918-1 header segments (`APPn`/`COM`/`SOFn`/`SOS`). | Raw `EOI` byte scans split valid frames early whenever `APPn` or `COM` metadata contains `0xFF 0xD9`. |
@@ -53,6 +53,13 @@ URL without losing entity history.
   `dropped_frames`, `robot_reachable`, `on_charger`, `charging`,
   `battery_level`, `battery_volts`.
 - `switch.<name>_camera_allowed`: withholds the camera from Home Assistant.
+- `switch.<name>_quiet_mode`: slider toggle that engages/releases persistent
+  wire-pod `RESERVE_CONTROL` (`BehaviorSDKLock`) + audio mute so Vector stays
+  still and silent overnight or while away without autonomous roaming,
+  expressions, or reactions (requires `wire-pod` `/api-sdk/quiet_mode`; stays
+  available whenever `wire-pod` is up even while Vector sleeps). Attributes:
+  `active`, `holding_reserve`, `muted`, `robot_reachable`, `pending_restore`,
+  `last_error`.
 - `sensor.<name>_battery_voltage`: live voltage (`V`) from `get_battery`.
 - `sensor.<name>_battery_level`: enum (`unknown`, `low`, `nominal`, `full`).
 - `sensor.<name>_camera_status`: diagnostic enum mirroring `camera_state`.
@@ -63,10 +70,24 @@ URL without losing entity history.
 Integration diagnostics download (`diagnostics.py`) exports redacted config,
 battery coordinator payload, and `CameraHub` counters.
 
-Battery is polled every `battery_poll_s` seconds (default `60`, configurable
-in integration options). When wire-pod is unreachable the entities are
+Battery and `quiet_mode` are polled every `battery_poll_s` seconds (default `60`,
+configurable in integration options). When wire-pod is unreachable the entities are
 unavailable; when wire-pod answers but the robot does not, the camera and
-diagnostics report `robot_unreachable`.
+diagnostics report `robot_unreachable` while `switch.<name>_quiet_mode` remains
+available so automations can still arm or clear Quiet mode.
+
+### Example overnight / extended-away Home Assistant automation
+
+```yaml
+alias: Vector Quiet Mode overnight
+triggers:
+  - trigger: time
+    at: "22:30:00"
+actions:
+  - action: switch.turn_on
+    target:
+      entity_id: switch.vector_c7k8_quiet_mode
+```
 
 ## Tests
 

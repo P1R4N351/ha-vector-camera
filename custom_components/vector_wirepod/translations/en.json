@@ -39,5 +39,11 @@
         }
       }
     }
+  },
+  "entity": {
+    "switch": {
+      "camera_allowed": {"name": "Camera allowed"},
+      "quiet_mode": {"name": "Quiet mode"}
+    }
   }
 }

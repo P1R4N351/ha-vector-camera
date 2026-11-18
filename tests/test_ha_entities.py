@@ -390,8 +390,8 @@ class EntityAndFlowTests(unittest.IsolatedAsyncioTestCase):
         self.pod.battery = '{"battery_volts": 3.742}'
         comp, entry = await self._setup_entry(options={"battery_poll_s": 30, "still_refresh_s": 0})
         added = await self._collect_entities(entry)
-        self.assertEqual(len(added), 8)
-        cam, sw, v_sen, lvl_sen, st_sen, plug_bs, chg_bs, reach_bs = added
+        self.assertEqual(len(added), 9)
+        cam, sw, quiet_sw, v_sen, lvl_sen, st_sen, plug_bs, chg_bs, reach_bs = added
         _LAST_RESTORE_STATE = "off"
         await sw.async_added_to_hass()
         self.assertFalse(sw.is_on)
@@ -399,6 +399,19 @@ class EntityAndFlowTests(unittest.IsolatedAsyncioTestCase):
         await sw.async_turn_on()
         self.assertTrue(sw.is_on)
         self.assertGreaterEqual(sw.writes, 1)
+        _LAST_RESTORE_STATE = "on"
+        await quiet_sw.async_added_to_hass()
+        self.assertTrue(quiet_sw.available)
+        self.assertTrue(quiet_sw.is_on)
+        self.assertTrue(self.pod.quiet_enabled)
+        self.assertTrue(quiet_sw.extra_state_attributes["holding_reserve"])
+        await quiet_sw.async_turn_off()
+        self.assertFalse(quiet_sw.is_on)
+        self.assertFalse(self.pod.quiet_enabled)
+        self.assertEqual(quiet_sw.icon, "mdi:sleep-off")
+        await quiet_sw.async_turn_on()
+        self.assertTrue(quiet_sw.is_on)
+        self.assertEqual(quiet_sw.icon, "mdi:sleep")
         self.assertEqual(v_sen.native_value, 3.742)
         self.assertEqual(lvl_sen.native_value, "unknown")
         self.assertIs(plug_bs.is_on, False)
@@ -409,8 +422,24 @@ class EntityAndFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diag["entry"]["wirepod_url"], "**REDACTED**")
         self.assertEqual(diag["entry"]["serial"], "**REDACTED**")
         self.assertEqual(diag["hub"]["state"], "idle")
+        self.assertTrue(diag["coordinator"]["quiet_mode"]["enabled"])
         self.assertTrue(await comp.async_unload_entry(self.hass, entry))
         _LAST_RESTORE_STATE = "on"
+
+    async def test_quiet_mode_available_while_robot_asleep_and_404_unavailable(self):
+        self.pod.battery_status = 502
+        self.pod.battery = '{"error": "robot asleep"}'
+        comp, entry = await self._setup_entry(options={"battery_poll_s": 30, "still_refresh_s": 0})
+        added = await self._collect_entities(entry)
+        quiet_sw, reach_bs = added[2], added[8]
+        self.assertFalse(reach_bs.is_on)
+        self.assertTrue(quiet_sw.available)
+        await quiet_sw.async_turn_on()
+        self.assertTrue(self.pod.quiet_enabled)
+        self.pod.quiet_supported = False
+        await entry.runtime_data.coordinator.async_refresh()
+        self.assertFalse(quiet_sw.available)
+        await comp.async_unload_entry(self.hass, entry)
 
     async def test_unreachable_wirepod_marks_entities_unavailable(self):
         comp, entry = await self._setup_entry()
@@ -422,6 +451,7 @@ class EntityAndFlowTests(unittest.IsolatedAsyncioTestCase):
         added2 = await self._collect_entities(entry2)
         entry2.runtime_data.coordinator.last_update_success = False
         self.assertFalse(added2[2].available)
+        self.assertFalse(added2[3].available)
         self.assertIsNotNone(added[0])
         await comp2.async_unload_entry(self.hass, entry2)
 

@@ -16,7 +16,7 @@ TO_REDACT = {CONF_WIREPOD_URL, CONF_SERIAL, "ip_address"}
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
-    """Return redacted entry, options, battery coordinator, and hub state."""
+    """Return redacted entry, options, coordinator (battery + quiet_mode), and hub state."""
     assert hass is not None and entry is not None
     data = entry.runtime_data
     return {

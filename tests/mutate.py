@@ -88,6 +88,18 @@ ARMS: list[tuple[str, list[tuple[str, str]]]] = [
      [("        self._signal()\n        self._notify()\n", "        self._signal()\n")]),
     ("lease can be released twice",
      [("        if self._held:\n", "        if True:\n")]),
+    ("enable flag allowed on non-quiet_mode path",
+     [('        if path != "/api-sdk/quiet_mode" or serial is None or not isinstance(enable, bool):\n',
+       '        if False:\n')]),
+    ("quiet_mode rejects missing enabled bool",
+     [('    if not isinstance(enabled, bool):\n        raise WirePodError("quiet_mode: invalid enabled")',
+       '    if False:\n        raise WirePodError("quiet_mode: invalid enabled")')]),
+    ("get_quiet_mode 404 treated as error",
+     [('        if allow_404 and resp.status == 404:\n            return None',
+       '        if False:\n            return None')]),
+    ("quiet_mode ignores non-200 status",
+     [('        if resp.status != 200:\n            snippet = text.strip()[:120]',
+       '        if False:\n            snippet = text.strip()[:120]')]),
 ]
 NEUTRAL = ("comment only (must survive)",
            [('"""Passive access to one Vector', '"""Passive  access to one Vector')])

@@ -58,6 +58,9 @@ class FakeWirePod:
         self.stopping = False
         self.battery = '{"battery_level":3,"battery_volts":3.55,"is_on_charger_platform":true}'
         self.battery_status = 200
+        self.quiet_enabled = False
+        self.quiet_supported = True
+        self.quiet_status = 200
         self.cam_status = 504
         self.cam_error_body = b"error: camera_frame_timeout"
         self.injected_prefix = b""
@@ -65,6 +68,7 @@ class FakeWirePod:
         self.app.router.add_get("/cam-stream", self.cam)
         self.app.router.add_get("/api-sdk/get_battery", self.bat)
         self.app.router.add_get("/api-sdk/get_sdk_info", self.info)
+        self.app.router.add_route("*", "/api-sdk/quiet_mode", self.quiet)
         self.app.router.add_route("*", "/{tail:.*}", self.other)
 
     async def start(self) -> str:
@@ -97,6 +101,31 @@ class FakeWirePod:
 
     async def bat(self, request: web.Request) -> web.Response:
         return web.Response(status=self.battery_status, text=self.battery)
+
+    async def quiet(self, request: web.Request) -> web.Response:
+        if not self.quiet_supported:
+            return web.Response(status=404, text="not found")
+        if self.quiet_status != 200:
+            return web.json_response(
+                {"enabled": False, "last_error": "quiet_mode failed"},
+                status=self.quiet_status,
+            )
+        en = request.query.get("enable")
+        if en == "true":
+            self.quiet_enabled = True
+        elif en == "false":
+            self.quiet_enabled = False
+        return web.json_response({
+            "serial": request.query.get("serial", SERIAL),
+            "enabled": self.quiet_enabled,
+            "active": self.quiet_enabled,
+            "holding_reserve": self.quiet_enabled,
+            "muted": self.quiet_enabled,
+            "robot_reachable": True,
+            "pending_restore": False,
+            "last_error": "",
+            "updated_at": "2026-11-18T12:00:00Z",
+        })
 
     async def cam(self, request: web.Request) -> web.StreamResponse:
         self.connections += 1
@@ -179,6 +208,10 @@ class Policy(unittest.TestCase):
             wp.build_url("http://x", "/cam-stream", "0050&x=1")
         self.assertEqual(wp.build_url("http://x/", "/cam-stream", SERIAL),
                          "http://x/cam-stream?serial=0dd1cafe")
+        self.assertEqual(wp.build_url("http://x/", "/api-sdk/quiet_mode", SERIAL, enable=True),
+                         "http://x/api-sdk/quiet_mode?serial=0dd1cafe&enable=true")
+        with self.assertRaises(ValueError):
+            wp.build_url("http://x/", "/cam-stream", SERIAL, enable=True)
 
     def test_source_names_no_other_wirepod_path(self):
         literals: set[str] = set()
@@ -493,6 +526,24 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(wp.WirePodError):
             await wp.get_battery(self.session, self.base, SERIAL)
         self.assertEqual(self.pod.other_paths, [])
+
+    async def test_quiet_mode_calls_and_errors(self):
+        st0 = await wp.get_quiet_mode(self.session, self.base, SERIAL)
+        self.assertEqual(st0["enabled"], False)
+        st1 = await wp.set_quiet_mode(self.session, self.base, SERIAL, True)
+        self.assertTrue(st1["enabled"])
+        self.assertTrue(st1["holding_reserve"])
+        self.assertTrue(st1["muted"])
+        st2 = await wp.set_quiet_mode(self.session, self.base, SERIAL, False)
+        self.assertFalse(st2["enabled"])
+        self.pod.quiet_supported = False
+        self.assertIsNone(await wp.get_quiet_mode(self.session, self.base, SERIAL))
+        self.pod.quiet_supported = True
+        self.pod.quiet_status = 500
+        with self.assertRaises(wp.WirePodError):
+            await wp.set_quiet_mode(self.session, self.base, SERIAL, True)
+        with self.assertRaises(wp.WirePodError):
+            wp._normalize_quiet_mode({"enabled": "yes"})
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-ALLOWED_PATHS = ("/api-sdk/get_sdk_info", "/api-sdk/get_battery", "/cam-stream")
+ALLOWED_PATHS = ("/api-sdk/get_sdk_info", "/api-sdk/get_battery", "/api-sdk/quiet_mode", "/cam-stream")
 
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
@@ -66,7 +66,8 @@ class WirePodError(Exception):
     """wire-pod answered, but not with what was asked for."""
 
 
-def build_url(base_url: str, path: str, serial: str | None = None) -> str:
+def build_url(base_url: str, path: str, serial: str | None = None,
+              *, enable: bool | None = None) -> str:
     """Return a wire-pod URL. Refuses any path outside ALLOWED_PATHS."""
     if path not in ALLOWED_PATHS:
         raise ValueError(f"path not allowed: {path!r}")
@@ -77,6 +78,10 @@ def build_url(base_url: str, path: str, serial: str | None = None) -> str:
         if not serial.isalnum():
             raise ValueError(f"invalid serial: {serial!r}")
         url += "?serial=" + quote(serial)
+    if enable is not None:
+        if path != "/api-sdk/quiet_mode" or serial is None or not isinstance(enable, bool):
+            raise ValueError(f"enable only valid on quiet_mode with serial: {path!r}")
+        url += "&enable=" + ("true" if enable else "false")
     return url
 
 
@@ -111,6 +116,68 @@ def _normalize_battery(data: dict) -> dict:
     out["battery_volts"] = None if raw_v is None else round(float(raw_v), 3)
     out["is_on_charger_platform"] = bool(data.get("is_on_charger_platform", False))
     out["is_charging"] = bool(data.get("is_charging", False))
+    return out
+
+
+def _normalize_quiet_mode(data: dict) -> dict:
+    """Normalize wire-pod quiet_mode JSON fields with explicit booleans."""
+    assert isinstance(data, dict)
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        raise WirePodError("quiet_mode: invalid enabled")
+    return {
+        "enabled": enabled,
+        "active": bool(data.get("active", False)),
+        "holding_reserve": bool(data.get("holding_reserve", False)),
+        "muted": bool(data.get("muted", False)),
+        "robot_reachable": bool(data.get("robot_reachable", False)),
+        "pending_restore": bool(data.get("pending_restore", False)),
+        "last_error": str(data.get("last_error") or "")[:200],
+        "updated_at": str(data.get("updated_at") or "")[:40],
+    }
+
+
+def _parse_quiet_json(text: str) -> dict:
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise WirePodError(f"quiet_mode: not JSON: {text[:80]!r}") from exc
+    if not isinstance(data, dict):
+        raise WirePodError("quiet_mode: not an object")
+    return _normalize_quiet_mode(data)
+
+
+async def _quiet_http_json(session: aiohttp.ClientSession, method: str, url: str,
+                           timeout_s: float, allow_404: bool = False) -> dict | None:
+    """Execute GET/POST against wire-pod quiet_mode and validate status + JSON payload."""
+    assert timeout_s > 0 and method in ("GET", "POST")
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.request(method, url, timeout=tmo) as resp:
+        text = await resp.text()
+        if allow_404 and resp.status == 404:
+            return None
+        if resp.status != 200:
+            snippet = text.strip()[:120]
+            msg = f"quiet_mode: http {resp.status}: {snippet}" if snippet else f"quiet_mode: http {resp.status}"
+            raise WirePodError(msg)
+    return _parse_quiet_json(text)
+
+
+async def get_quiet_mode(session: aiohttp.ClientSession, base_url: str, serial: str,
+                         timeout_s: float = 10.0) -> dict | None:
+    """Fetch passive quiet_mode status from wire-pod, or None if endpoint absent (404)."""
+    assert timeout_s > 0
+    url = build_url(base_url, "/api-sdk/quiet_mode", serial)
+    return await _quiet_http_json(session, "GET", url, timeout_s, allow_404=True)
+
+
+async def set_quiet_mode(session: aiohttp.ClientSession, base_url: str, serial: str,
+                         enabled: bool, timeout_s: float = 10.0) -> dict:
+    """Enable or disable wire-pod persistent quiet mode for serial."""
+    assert timeout_s > 0 and isinstance(enabled, bool)
+    url = build_url(base_url, "/api-sdk/quiet_mode", serial, enable=enabled)
+    out = await _quiet_http_json(session, "POST", url, timeout_s, allow_404=False)
+    assert isinstance(out, dict)
     return out
 
 

@@ -19,7 +19,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (BATTERY_POLL_S, BATTERY_TIMEOUT_S, CONF_BATTERY_POLL_S,
                     CONF_SERIAL, CONF_WIREPOD_URL, DOMAIN, MIN_BATTERY_POLL_S,
                     PLATFORMS)
-from .wirepod import CameraHub, HubConfig, WirePodError, get_battery
+from .wirepod import (CameraHub, HubConfig, WirePodError, get_battery,
+                      get_quiet_mode)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +29,9 @@ _LOGGER = logging.getLogger(__name__)
 class VectorData:
     hub: CameraHub
     coordinator: DataUpdateCoordinator
+    session: aiohttp.ClientSession
+    base_url: str
+    serial: str
 
 
 def _make_coordinator(hass: HomeAssistant, entry: ConfigEntry,
@@ -39,16 +43,26 @@ def _make_coordinator(hass: HomeAssistant, entry: ConfigEntry,
     poll_s = max(MIN_BATTERY_POLL_S, int(entry.options.get(CONF_BATTERY_POLL_S, BATTERY_POLL_S)))
 
     async def _update() -> dict:
+        quiet: dict | None = None
+        try:
+            quiet = await get_quiet_mode(session, base, serial)
+        except WirePodError as exc:
+            _LOGGER.debug("quiet_mode poll error for %s: %s", serial, exc)
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            hub.set_robot_reachable(False, "wire-pod unreachable")
+            raise UpdateFailed(f"wire-pod unreachable: {exc}") from exc
+
         try:
             data = await get_battery(session, base, serial, BATTERY_TIMEOUT_S)
         except WirePodError as exc:
             hub.set_robot_reachable(False, f"robot not answering wire-pod: {exc}"[:200])
-            return {"robot_reachable": False, "error": str(exc)[:200]}
+            return {"robot_reachable": False, "error": str(exc)[:200], "quiet_mode": quiet}
         except (aiohttp.ClientError, TimeoutError) as exc:
             hub.set_robot_reachable(False, "wire-pod unreachable")
             raise UpdateFailed(f"wire-pod unreachable: {exc}") from exc
         hub.set_robot_reachable(True)
         data["robot_reachable"] = True
+        data["quiet_mode"] = quiet
         return data
 
     return DataUpdateCoordinator(
@@ -63,7 +77,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                        serial=entry.data[CONF_SERIAL]))
     coordinator = _make_coordinator(hass, entry, session, hub)
     await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = VectorData(hub=hub, coordinator=coordinator)
+    entry.runtime_data = VectorData(
+        hub=hub,
+        coordinator=coordinator,
+        session=session,
+        base_url=entry.data[CONF_WIREPOD_URL],
+        serial=entry.data[CONF_SERIAL],
+    )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
