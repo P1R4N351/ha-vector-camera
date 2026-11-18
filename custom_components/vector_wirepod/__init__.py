@@ -16,8 +16,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import (BATTERY_POLL_S, BATTERY_TIMEOUT_S, CONF_SERIAL, CONF_WIREPOD_URL,
-                    DOMAIN, PLATFORMS)
+from .const import (BATTERY_POLL_S, BATTERY_TIMEOUT_S, CONF_BATTERY_POLL_S,
+                    CONF_SERIAL, CONF_WIREPOD_URL, DOMAIN, MIN_BATTERY_POLL_S,
+                    PLATFORMS)
 from .wirepod import CameraHub, HubConfig, WirePodError, get_battery
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,8 +32,11 @@ class VectorData:
 
 def _make_coordinator(hass: HomeAssistant, entry: ConfigEntry,
                       session: aiohttp.ClientSession, hub: CameraHub) -> DataUpdateCoordinator:
+    assert hass is not None and entry is not None
+    assert session is not None and hub is not None
     base = entry.data[CONF_WIREPOD_URL]
     serial = entry.data[CONF_SERIAL]
+    poll_s = max(MIN_BATTERY_POLL_S, int(entry.options.get(CONF_BATTERY_POLL_S, BATTERY_POLL_S)))
 
     async def _update() -> dict:
         try:
@@ -49,10 +53,11 @@ def _make_coordinator(hass: HomeAssistant, entry: ConfigEntry,
 
     return DataUpdateCoordinator(
         hass, _LOGGER, config_entry=entry, name=f"{DOMAIN} {serial}",
-        update_interval=timedelta(seconds=BATTERY_POLL_S), update_method=_update)
+        update_interval=timedelta(seconds=poll_s), update_method=_update)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    assert hass is not None and entry is not None
     session = async_get_clientsession(hass)
     hub = CameraHub(session, HubConfig(base_url=entry.data[CONF_WIREPOD_URL],
                                        serial=entry.data[CONF_SERIAL]))
@@ -69,6 +74,7 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    assert hass is not None and entry is not None
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if ok:
         await entry.runtime_data.hub.close()

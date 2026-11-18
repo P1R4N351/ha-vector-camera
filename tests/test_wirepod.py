@@ -1,7 +1,7 @@
 """Offline tests for the Vector camera policy, against a fake wire-pod.
 
 Authored-by: CPCS. Needs aiohttp and Pillow; no Home Assistant.
-Run: python3 -m unittest discover -s skills/ha-vector-camera/tests
+Run: python3 -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import ast
 import asyncio
 import io
 import pathlib
+import struct
 import sys
 import unittest
 
@@ -18,16 +19,31 @@ import aiohttp
 from PIL import Image
 
 PKG = pathlib.Path(__file__).resolve().parents[1] / "custom_components" / "vector_wirepod"
-sys.path.insert(0, str(PKG))
+if str(PKG) not in sys.path:
+    sys.path.insert(0, str(PKG))
 import wirepod as wp  # noqa: E402
 
 SERIAL = "0dd1cafe"
 
 
 def jpeg(n: int) -> bytes:
+    assert isinstance(n, int) and n >= 0
     out = io.BytesIO()
     Image.new("RGB", (32, 24), (n % 255, 40, 90)).save(out, format="JPEG")
-    return out.getvalue()
+    raw = out.getvalue()
+    assert raw[:2] == wp.SOI and raw[-2:] == wp.EOI
+    return raw
+
+
+def jpeg_with_eoi_in_com(n: int) -> bytes:
+    """Build a valid JPEG carrying an embedded FF D9 inside a COM header segment."""
+    raw = jpeg(n)
+    payload = b"\xff\xd9fake-exif-thumb-end"
+    seg = b"\xff\xfe" + struct.pack(">H", len(payload) + 2) + payload
+    out = raw[:2] + seg + raw[2:]
+    assert out[:4] == b"\xff\xd8\xff\xfe"
+    assert wp.EOI in seg
+    return out
 
 
 class FakeWirePod:
@@ -41,6 +57,10 @@ class FakeWirePod:
         self.other_paths: list[str] = []
         self.stopping = False
         self.battery = '{"battery_level":3,"battery_volts":3.55,"is_on_charger_platform":true}'
+        self.battery_status = 200
+        self.cam_status = 504
+        self.cam_error_body = b"error: camera_frame_timeout"
+        self.injected_prefix = b""
         self.app = web.Application()
         self.app.router.add_get("/cam-stream", self.cam)
         self.app.router.add_get("/api-sdk/get_battery", self.bat)
@@ -48,11 +68,13 @@ class FakeWirePod:
         self.app.router.add_route("*", "/{tail:.*}", self.other)
 
     async def start(self) -> str:
+        assert self.app is not None
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
+        assert port > 0
         return f"http://127.0.0.1:{port}"
 
     async def stop(self) -> None:
@@ -60,6 +82,7 @@ class FakeWirePod:
         await self.runner.cleanup()
 
     async def nap(self, seconds: float) -> None:
+        assert seconds >= 0
         for _ in range(int(seconds / 0.05)):
             if self.stopping:
                 return
@@ -73,7 +96,7 @@ class FakeWirePod:
         return web.Response(text='{"robots":[{"esn":"0dd1cafe","ip_address":"192.0.2.9"}]}')
 
     async def bat(self, request: web.Request) -> web.Response:
-        return web.Response(text=self.battery)
+        return web.Response(status=self.battery_status, text=self.battery)
 
     async def cam(self, request: web.Request) -> web.StreamResponse:
         self.connections += 1
@@ -83,7 +106,7 @@ class FakeWirePod:
         finally:
             self.active -= 1
 
-    async def _cam(self, request: web.Request) -> web.StreamResponse:
+    async def _send_cam_headers_mode(self, request: web.Request) -> web.StreamResponse | None:
         if self.mode == "hang":
             await self.nap(60)
             return web.Response(status=503)
@@ -91,11 +114,21 @@ class FakeWirePod:
             await self.nap(0.35)
         if self.mode == "error":
             return web.Response(text="error: robot not found")
+        if self.mode == "http_error":
+            return web.Response(status=self.cam_status, body=self.cam_error_body)
+        return None
+
+    async def _cam(self, request: web.Request) -> web.StreamResponse:
+        assert request is not None
+        early = await self._send_cam_headers_mode(request)
+        if early is not None:
+            return early
         resp = web.StreamResponse()
         resp.headers["Content-Type"] = "multipart/x-mixed-replace; boundary=--boundary"
         await resp.prepare(request)
         if self.mode == "eof_now":
             return resp
+        prefix, self.injected_prefix = self.injected_prefix, b""
         for i in range(100000):
             if self.stopping:
                 return resp
@@ -105,7 +138,8 @@ class FakeWirePod:
                 await self.nap(60)
                 return resp
             try:
-                await resp.write(b"--boundary\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg(i))
+                head = prefix if i == 0 else b""
+                await resp.write(b"--boundary\r\nContent-Type: image/jpeg\r\n\r\n" + head + jpeg(i))
             except ConnectionResetError:
                 return resp
             await asyncio.sleep(0.02)
@@ -182,6 +216,17 @@ class Parser(unittest.TestCase):
         self.assertEqual(p.dropped, 1)
         self.assertEqual(p.feed(jpeg(4)), [jpeg(4)])
 
+    def test_jpeg_header_segment_containing_eoi_bytes_is_not_truncated(self):
+        frame = jpeg_with_eoi_in_com(7)
+        p = wp.FrameParser(100000)
+        got = []
+        for i in range(0, len(frame), 13):
+            got += p.feed(frame[i:i + 13])
+        self.assertEqual(got, [frame])
+        self.assertEqual(p.dropped, 0)
+        img = Image.open(io.BytesIO(got[0]))
+        img.verify()
+
 
 class StatusImage(unittest.TestCase):
     def test_renders_jpeg_with_and_without_frame(self):
@@ -221,15 +266,22 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         a.release(), b.release()
         await hub.close()
 
-    async def test_last_release_closes_upstream(self):
+    async def test_last_release_closes_upstream_and_returns_idle(self):
         hub = self.hub()
         lease = hub.acquire()
         self.assertIsNotNone(await hub.next_frame(0, 2))
         self.assertEqual(self.pod.active, 1)
+        self.assertEqual(hub.state, wp.STATE_STREAMING)
         lease.release()
+        self.assertEqual(hub.state, wp.STATE_IDLE)
         self.assertTrue(await settle(lambda: self.pod.active == 0, 1.5))
         lease.release()
         self.assertEqual(hub.viewers, 0)
+        self.pod.mode = "hang"
+        lease2 = hub.acquire()
+        await settle(lambda: hub.state == wp.STATE_STARTING, 1.0)
+        lease2.release()
+        self.assertEqual(hub.state, wp.STATE_IDLE)
         await hub.close()
 
     async def test_sleeping_robot_gives_up_and_backs_off(self):
@@ -304,7 +356,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         lease.release()
         await hub.close()
 
-    async def test_wirepod_error_text_is_a_failure(self):
+    async def test_wirepod_error_text_and_http_error_are_failures(self):
         self.pod.mode = "error"
         hub = self.hub()
         lease = hub.acquire()
@@ -312,6 +364,15 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hub.state, wp.STATE_NO_FRAMES)
         self.assertIn("robot not found", hub.detail)
         lease.release()
+        self.clock.t += 5.0
+        self.pod.mode = "http_error"
+        self.pod.cam_status = 504
+        self.pod.cam_error_body = b"error: camera_frame_timeout"
+        lease2 = hub.acquire()
+        self.assertIsNone(await hub.next_frame(0, 2))
+        self.assertIn("504", hub.detail)
+        self.assertIn("camera_frame_timeout", hub.detail)
+        lease2.release()
         await hub.close()
 
     async def test_stream_ending_before_a_frame_is_a_failure(self):
@@ -323,20 +384,49 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         lease.release()
         await hub.close()
 
-    async def test_withheld_closes_and_refuses(self):
+    async def test_withheld_closes_refuses_and_keeps_precedence(self):
         hub = self.hub()
         lease = hub.acquire()
         self.assertIsNotNone(await hub.next_frame(0, 2))
+        hub.set_allowed(True)
+        self.assertEqual(hub.state, wp.STATE_STREAMING)
         hub.set_allowed(False)
         self.assertTrue(await settle(lambda: self.pod.active == 0, 1.5))
         self.assertEqual(hub.state, wp.STATE_WITHHELD)
+        hub.set_robot_reachable(False, "robot down")
+        self.assertEqual(hub.state, wp.STATE_WITHHELD)
+        hub.set_robot_reachable(True)
+        self.assertEqual(hub.state, wp.STATE_WITHHELD)
         other = hub.acquire()
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
         self.assertEqual(self.pod.connections, 1)
+        hub.set_robot_reachable(False, "robot down")
         hub.set_allowed(True)
+        self.assertEqual(hub.state, wp.STATE_ROBOT_UNREACHABLE)
+        self.assertEqual(hub.detail, "robot down")
+        hub.set_robot_reachable(True)
         self.assertIsNotNone(await hub.next_frame(hub.seq, 2))
         self.assertEqual(self.pod.connections, 2)
         lease.release(), other.release()
+        await hub.close()
+
+    async def test_waiting_viewer_auto_starts_after_backoff_and_wake(self):
+        self.pod.mode = "hang"
+        hub = self.hub()
+        lease = hub.acquire()
+        self.assertIsNone(await hub.next_frame(0, 5))
+        self.clock.t += 2.0
+        self.pod.mode = "stream"
+        got = await hub.next_frame(0, 2)
+        self.assertIsNotNone(got)
+        self.assertEqual(self.pod.connections, 2)
+        hub.set_allowed(False)
+        wait_task = asyncio.create_task(hub.wait_wake(hub.seq, 2.0))
+        await asyncio.sleep(0.05)
+        hub.set_allowed(True)
+        woken = await wait_task
+        self.assertIsNotNone(woken)
+        lease.release()
         await hub.close()
 
     async def test_still_uses_cache_and_refreshes_briefly(self):
@@ -354,14 +444,17 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pod.connections, 2)
         await hub.close()
 
-    async def test_stall_after_frames_is_not_a_failure(self):
+    async def test_stall_after_frames_and_dropped_diagnostics(self):
         self.pod.mode = "stall_after"
+        self.pod.injected_prefix = b"\xff\xd8xx\xff\xd9"
         hub = self.hub()
         lease = hub.acquire()
         self.assertIsNotNone(await hub.next_frame(0, 2))
         self.assertTrue(await settle(lambda: hub.sessions_opened >= 2, 2.0))
         self.assertEqual(hub.retry_in_s(), 0)
         self.assertNotEqual(hub.state, wp.STATE_NO_FRAMES)
+        self.assertGreaterEqual(hub.dropped_frames, 1)
+        self.assertEqual(hub.diagnostics()["dropped_frames"], hub.dropped_frames)
         lease.release()
         await hub.close()
 
@@ -383,6 +476,19 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robots, [{"esn": SERIAL, "ip_address": "192.0.2.9"}])
         bat = await wp.get_battery(self.session, self.base, SERIAL)
         self.assertEqual(bat["battery_level"], 3)
+        self.assertIs(bat["is_on_charger_platform"], True)
+        self.assertIs(bat["is_charging"], False)
+        self.pod.battery = '{"battery_volts": 3.8126}'
+        omitted = await wp.get_battery(self.session, self.base, SERIAL)
+        self.assertIs(omitted["is_on_charger_platform"], False)
+        self.assertIs(omitted["is_charging"], False)
+        self.assertEqual(omitted["battery_level"], 0)
+        self.assertEqual(omitted["battery_volts"], 3.813)
+        self.pod.battery_status = 502
+        self.pod.battery = '{"error": "bad gateway"}'
+        with self.assertRaises(wp.WirePodError):
+            await wp.get_battery(self.session, self.base, SERIAL)
+        self.pod.battery_status = 200
         self.pod.battery = "error: robot unreachable"
         with self.assertRaises(wp.WirePodError):
             await wp.get_battery(self.session, self.base, SERIAL)

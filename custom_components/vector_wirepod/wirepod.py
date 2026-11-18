@@ -6,8 +6,8 @@ on its own.
 What "compliant with Vector" means here, each point enforced in this file:
 
 1. Read only. The only wire-pod paths ever requested are ALLOWED_PATHS. No
-   behaviour control, motion, speech, eye colour, wake word or event stream.
-   Nothing here can wake the robot or take it from what it is doing.
+   motion, speech, LED, or state-changing endpoints. Nothing here can wake the
+   robot or take it from what it is doing.
 2. One upstream per robot. wire-pod serves one camera viewer per robot and
    ends the previous one when a new one arrives, so every viewer shares a
    single /cam-stream connection, opened only while someone is watching and
@@ -41,6 +41,8 @@ SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
 MIN_FRAME_BYTES = 64
 MAX_FRAMES_PER_CHUNK = 64
+MAX_JPEG_SEGMENTS = 256
+MAX_FILL_BYTES = 16
 MAX_WAKEUPS = 10_000
 MAX_LISTENERS = 16
 
@@ -50,6 +52,14 @@ STATE_STREAMING = "streaming"
 STATE_NO_FRAMES = "no_frames"
 STATE_WITHHELD = "withheld"
 STATE_ROBOT_UNREACHABLE = "robot_unreachable"
+ALL_STATES = (
+    STATE_IDLE,
+    STATE_STARTING,
+    STATE_STREAMING,
+    STATE_NO_FRAMES,
+    STATE_WITHHELD,
+    STATE_ROBOT_UNREACHABLE,
+)
 
 
 class WirePodError(Exception):
@@ -73,6 +83,7 @@ def build_url(base_url: str, path: str, serial: str | None = None) -> str:
 async def get_sdk_info(session: aiohttp.ClientSession, base_url: str,
                        timeout_s: float = 10.0) -> list[dict]:
     """Robots wire-pod knows: [{'esn': ..., 'ip_address': ...}]."""
+    assert timeout_s > 0
     url = build_url(base_url, "/api-sdk/get_sdk_info")
     tmo = aiohttp.ClientTimeout(total=timeout_s)
     async with session.get(url, timeout=tmo) as resp:
@@ -87,6 +98,22 @@ async def get_sdk_info(session: aiohttp.ClientSession, base_url: str,
             for r in robots if isinstance(r, dict) and r.get("esn")]
 
 
+def _normalize_battery(data: dict) -> dict:
+    """Restore zero/false fields omitted by Go protobuf JSON omitempty."""
+    raw_lvl = data.get("battery_level", 0)
+    if isinstance(raw_lvl, bool) or not isinstance(raw_lvl, (int, float)):
+        raise WirePodError("get_battery: invalid battery_level")
+    raw_v = data.get("battery_volts")
+    if raw_v is not None and (isinstance(raw_v, bool) or not isinstance(raw_v, (int, float))):
+        raise WirePodError("get_battery: invalid battery_volts")
+    out = dict(data)
+    out["battery_level"] = int(raw_lvl)
+    out["battery_volts"] = None if raw_v is None else round(float(raw_v), 3)
+    out["is_on_charger_platform"] = bool(data.get("is_on_charger_platform", False))
+    out["is_charging"] = bool(data.get("is_charging", False))
+    return out
+
+
 async def get_battery(session: aiohttp.ClientSession, base_url: str, serial: str,
                       timeout_s: float = 20.0) -> dict:
     """Battery state. wire-pod bounds this call at 15 s on its side.
@@ -94,10 +121,15 @@ async def get_battery(session: aiohttp.ClientSession, base_url: str, serial: str
     Raises WirePodError when wire-pod answers but the robot does not, and
     aiohttp.ClientError or TimeoutError when wire-pod itself is not reachable.
     """
+    assert timeout_s > 0
     url = build_url(base_url, "/api-sdk/get_battery", serial)
     tmo = aiohttp.ClientTimeout(total=timeout_s)
     async with session.get(url, timeout=tmo) as resp:
         text = await resp.text()
+        if resp.status != 200:
+            detail = text.strip()[:120]
+            msg = f"get_battery: http {resp.status}: {detail}" if detail else f"get_battery: http {resp.status}"
+            raise WirePodError(msg)
     if text.startswith("error"):
         raise WirePodError(text[:200])
     try:
@@ -106,14 +138,63 @@ async def get_battery(session: aiohttp.ClientSession, base_url: str, serial: str
         raise WirePodError(f"get_battery: not JSON: {text[:80]!r}") from exc
     if not isinstance(data, dict):
         raise WirePodError("get_battery: not an object")
-    return data
+    return _normalize_battery(data)
+
+
+def _skip_fill_ff(buf: bytearray, pos: int) -> int:
+    """Advance past up to MAX_FILL_BYTES of 0xFF marker padding."""
+    n = len(buf)
+    for _ in range(MAX_FILL_BYTES):
+        if pos >= n or buf[pos] != 0xFF:
+            return pos
+        pos += 1
+    return pos
+
+
+def _scan_eoi(buf: bytearray, pos: int) -> int:
+    """Return index immediately after EOI starting at pos, or -1."""
+    end = buf.find(EOI, pos)
+    return end + 2 if end >= 0 else -1
+
+
+def _find_jpeg_end(buf: bytearray) -> int:
+    """Find JPEG EOI after walking header segments so APPn/COM 0xFFD9 bytes do not split frames."""
+    assert buf[:2] == SOI
+    pos = 2
+    for _ in range(MAX_JPEG_SEGMENTS):
+        if pos >= len(buf):
+            return -1
+        if buf[pos] != 0xFF:
+            return _scan_eoi(buf, pos)
+        pos = _skip_fill_ff(buf, pos)
+        if pos >= len(buf):
+            return -1
+        marker = buf[pos]
+        pos += 1
+        if marker == 0xD9:
+            return pos
+        if marker == 0x00:
+            return _scan_eoi(buf, pos)
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            continue
+        if pos + 2 > len(buf):
+            return -1
+        seg_len = (buf[pos] << 8) | buf[pos + 1]
+        if seg_len < 2:
+            return _scan_eoi(buf, pos)
+        if pos + seg_len > len(buf):
+            return -1
+        pos += seg_len
+        if marker == 0xDA:
+            return _scan_eoi(buf, pos)
+    return -1
 
 
 class FrameParser:
-    """Cuts JPEG frames out of an MJPEG byte stream by SOI/EOI markers.
+    """Cuts JPEG frames out of an MJPEG byte stream using JPEG segments and SOI/EOI markers.
 
     wire-pod's multipart boundary does not match its own header, so the
-    boundary is ignored and only the JPEG markers are trusted.
+    boundary is ignored and JPEG framing markers are parsed directly.
     """
 
     def __init__(self, max_frame_bytes: int) -> None:
@@ -123,6 +204,7 @@ class FrameParser:
         self.dropped = 0
 
     def feed(self, chunk: bytes) -> list[bytes]:
+        assert isinstance(chunk, (bytes, bytearray))
         self._buf += chunk
         frames: list[bytes] = []
         for _ in range(MAX_FRAMES_PER_CHUNK):
@@ -132,13 +214,13 @@ class FrameParser:
                 break
             if start > 0:
                 del self._buf[:start]
-            end = self._buf.find(EOI, 2)
+            end = _find_jpeg_end(self._buf)
             if end < 0:
                 if len(self._buf) > self._max:
                     self._discard_oversized()
                 break
-            frame = bytes(self._buf[:end + 2])
-            del self._buf[:end + 2]
+            frame = bytes(self._buf[:end])
+            del self._buf[:end]
             if len(frame) >= MIN_FRAME_BYTES:
                 frames.append(frame)
             else:
@@ -168,6 +250,7 @@ class Lease:
     """One viewer's claim on the shared upstream. Release exactly once."""
 
     def __init__(self, hub: CameraHub) -> None:
+        assert hub is not None
         self._hub = hub
         self._held = True
 
@@ -182,6 +265,7 @@ class CameraHub:
 
     def __init__(self, session: aiohttp.ClientSession, cfg: HubConfig,
                  clock: Callable[[], float] = time.monotonic) -> None:
+        assert session is not None
         build_url(cfg.base_url, "/cam-stream", cfg.serial)
         assert 0 < cfg.backoff_min_s <= cfg.backoff_max_s
         self.cfg = cfg
@@ -190,6 +274,7 @@ class CameraHub:
         self._viewers = 0
         self._allowed = True
         self._reachable = True
+        self._unreachable_detail = ""
         self._task: asyncio.Task | None = None
         self._frame: bytes | None = None
         self._frame_at: float | None = None
@@ -199,6 +284,7 @@ class CameraHub:
         self._state = STATE_IDLE
         self._detail = ""
         self.sessions_opened = 0
+        self.dropped_frames = 0
         self._changed = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
 
@@ -239,9 +325,25 @@ class CameraHub:
         return (self._allowed and self._reachable
                 and self._clock() >= self._retry_at)
 
+    def diagnostics(self) -> dict:
+        age = self.frame_age_s()
+        return {
+            "state": self._state,
+            "detail": self._detail,
+            "allowed": self._allowed,
+            "reachable": self._reachable,
+            "viewers": self._viewers,
+            "seq": self._seq,
+            "frame_age_s": None if age is None else round(age, 1),
+            "retry_in_s": round(self.retry_in_s(), 1),
+            "sessions_opened": self.sessions_opened,
+            "dropped_frames": self.dropped_frames,
+        }
+
     # ---- control --------------------------------------------------------
     def add_listener(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Call callback on every state change (not every frame). Returns a remover."""
+        assert callable(callback)
         assert len(self._listeners) < MAX_LISTENERS, "too many listeners"
         self._listeners.append(callback)
 
@@ -260,39 +362,55 @@ class CameraHub:
         self._viewers -= 1
         if self._viewers == 0:
             self._stop()
+            if self._state in (STATE_STARTING, STATE_STREAMING):
+                self._reconcile_resting_state()
 
     def set_allowed(self, allowed: bool) -> None:
-        self._allowed = bool(allowed)
+        want = bool(allowed)
+        if want == self._allowed:
+            if not want and self._state != STATE_WITHHELD:
+                self._set_state(STATE_WITHHELD, "camera withheld by switch")
+            return
+        self._allowed = want
         if not self._allowed:
             self._stop()
             self._set_state(STATE_WITHHELD, "camera withheld by switch")
         else:
-            self._set_state(STATE_IDLE, "")
+            self._reconcile_resting_state()
             self._maybe_start()
 
     def set_robot_reachable(self, reachable: bool, detail: str = "") -> None:
         self._reachable = bool(reachable)
         if not self._reachable:
+            self._unreachable_detail = detail or "robot not answering"
             self._stop()
-            self._set_state(STATE_ROBOT_UNREACHABLE, detail or "robot not answering")
-        elif self._state == STATE_ROBOT_UNREACHABLE:
-            self._set_state(STATE_IDLE, "")
-            self._maybe_start()
+            if self._allowed:
+                self._set_state(STATE_ROBOT_UNREACHABLE, self._unreachable_detail)
+        else:
+            self._unreachable_detail = ""
+            if self._allowed and self._state == STATE_ROBOT_UNREACHABLE:
+                self._reconcile_resting_state()
+                self._maybe_start()
 
     async def close(self) -> None:
         task = self._task
         self._stop()
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+        if self._state in (STATE_STARTING, STATE_STREAMING):
+            self._reconcile_resting_state()
 
     # ---- frames ---------------------------------------------------------
     async def next_frame(self, after_seq: int, timeout_s: float) -> tuple[int, bytes] | None:
         """Wait for a frame newer than after_seq. None when none is coming."""
+        assert timeout_s > 0
+        assert isinstance(after_seq, int)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         for _ in range(MAX_WAKEUPS):
             if self._seq > after_seq and self._frame is not None:
                 return self._seq, self._frame
+            self._maybe_start()
             if self._task is None:
                 return None
             remaining = deadline - loop.time()
@@ -306,9 +424,32 @@ class CameraHub:
                 return None
         return None
 
+    async def wait_wake(self, after_seq: int, timeout_s: float) -> tuple[int, bytes] | None:
+        """Wait boundedly while resting for a new frame, backoff expiry, or switch toggle."""
+        assert timeout_s > 0
+        assert isinstance(after_seq, int)
+        self._maybe_start()
+        if self._seq > after_seq and self._frame is not None:
+            return self._seq, self._frame
+        if self._task is not None:
+            return await self.next_frame(after_seq, timeout_s)
+        event = self._changed
+        try:
+            async with asyncio.timeout(timeout_s):
+                await event.wait()
+        except TimeoutError:
+            pass
+        self._maybe_start()
+        if self._seq > after_seq and self._frame is not None:
+            return self._seq, self._frame
+        if self._task is not None:
+            return await self.next_frame(after_seq, timeout_s)
+        return None
+
     async def still(self, max_age_s: float, refresh: bool, wait_s: float) -> bytes | None:
         """A frame for a thumbnail. Opens the upstream only when the cached
         frame is older than max_age_s, refresh is set, and a start is due."""
+        assert max_age_s >= 0 and wait_s > 0
         age = self.frame_age_s()
         if self._frame is not None and age is not None and age <= max_age_s:
             return self._frame
@@ -331,10 +472,22 @@ class CameraHub:
             callback()
 
     def _set_state(self, state: str, detail: str) -> None:
+        assert state in ALL_STATES
         self._state = state
         self._detail = detail
         self._signal()
         self._notify()
+
+    def _reconcile_resting_state(self) -> None:
+        if not self._allowed:
+            self._set_state(STATE_WITHHELD, "camera withheld by switch")
+        elif not self._reachable:
+            self._set_state(STATE_ROBOT_UNREACHABLE, self._unreachable_detail or "robot not answering")
+        elif self._retry_at > self._clock():
+            if self._state != STATE_NO_FRAMES:
+                self._set_state(STATE_NO_FRAMES, f"waiting; next try in {int(self.retry_in_s())} s")
+        elif self._state != STATE_IDLE:
+            self._set_state(STATE_IDLE, "")
 
     def _maybe_start(self) -> None:
         if self._viewers > 0 and self._task is None and self.can_start():
@@ -348,6 +501,7 @@ class CameraHub:
         self._signal()
 
     def _publish(self, frame: bytes) -> None:
+        assert len(frame) >= MIN_FRAME_BYTES
         self._frame = frame
         self._frame_at = self._clock()
         self._seq += 1
@@ -367,6 +521,7 @@ class CameraHub:
 
     async def _run(self) -> None:
         me = asyncio.current_task()
+        assert me is not None
         seq_before = self._seq
         failure = ""
         self._set_state(STATE_STARTING, "")
@@ -391,7 +546,7 @@ class CameraHub:
             return
         self._fails = 0
         self._retry_at = 0.0
-        self._set_state(STATE_IDLE, "")
+        self._reconcile_resting_state()
         self._maybe_start()
 
     async def _session_frames(self) -> int:
@@ -405,11 +560,11 @@ class CameraHub:
         # deadlines below govern the start and each read instead.
         tmo = aiohttp.ClientTimeout(total=None, sock_connect=cfg.header_timeout_s)
         got = 0
+        parser = FrameParser(cfg.max_frame_bytes)
         async with asyncio.timeout(cfg.header_timeout_s):
             resp = await self._session.get(url, timeout=tmo)
         try:
             await self._check_start(resp)
-            parser = FrameParser(cfg.max_frame_bytes)
             for _ in range(cfg.max_chunks_per_session):
                 limit = cfg.header_timeout_s if got == 0 else cfg.stall_timeout_s
                 async with asyncio.timeout(limit):
@@ -420,12 +575,15 @@ class CameraHub:
                     got += 1
                     self._publish(frame)
         finally:
+            self.dropped_frames += parser.dropped
             resp.close()
         return got
 
     async def _check_start(self, resp: aiohttp.ClientResponse) -> None:
         if resp.status != 200:
-            raise WirePodError(f"cam-stream: http {resp.status}")
+            body = (await resp.content.read(200)).decode("utf-8", "replace").strip()
+            msg = f"cam-stream: http {resp.status}: {body}" if body else f"cam-stream: http {resp.status}"
+            raise WirePodError(msg)
         ctype = resp.headers.get("Content-Type", "")
         if "multipart" not in ctype.lower():
             body = await resp.content.read(200)

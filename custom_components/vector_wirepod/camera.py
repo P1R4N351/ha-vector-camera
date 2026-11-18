@@ -19,8 +19,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import placeholder
 from .const import (BATTERY_LEVELS, CONF_SERIAL, CONF_STILL_REFRESH_S,
-                    DEFAULT_STILL_REFRESH_S, DOMAIN, STILL_WAIT_S)
-from .wirepod import STATE_STREAMING
+                    DEFAULT_STILL_REFRESH_S, DOMAIN, MAX_STREAM_STATUS_FRAMES,
+                    STATUS_KEEPALIVE_S, STILL_WAIT_S)
+from .wirepod import STATE_STARTING, STATE_STREAMING
 
 LIVE_INTERVAL_S = 0.05
 FRESH_WHEN_NO_REFRESH_S = 60.0
@@ -69,6 +70,7 @@ class VectorCamera(CoordinatorEntity, Camera):
 
     @property
     def extra_state_attributes(self) -> dict:
+        assert self._hub is not None and self.coordinator is not None
         hub = self._hub
         age = hub.frame_age_s()
         data = self.coordinator.data or {}
@@ -79,8 +81,10 @@ class VectorCamera(CoordinatorEntity, Camera):
             "viewers": hub.viewers,
             "last_frame_age_s": None if age is None else round(age, 1),
             "next_start_in_s": round(hub.retry_in_s(), 1),
+            "dropped_frames": hub.dropped_frames,
             "robot_reachable": data.get("robot_reachable"),
             "on_charger": data.get("is_on_charger_platform"),
+            "charging": data.get("is_charging"),
             "battery_level": BATTERY_LEVELS.get(data.get("battery_level"), "unknown"),
             "battery_volts": data.get("battery_volts"),
         }
@@ -89,6 +93,7 @@ class VectorCamera(CoordinatorEntity, Camera):
         return float(self._refresh_s) if self._refresh_s > 0 else FRESH_WHEN_NO_REFRESH_S
 
     def _status_lines(self) -> list[str]:
+        assert self._hub is not None and self._entry is not None
         hub = self._hub
         data = self.coordinator.data or {}
         age = hub.frame_age_s()
@@ -97,7 +102,10 @@ class VectorCamera(CoordinatorEntity, Camera):
             lines.append(hub.detail)
         lines.append("No frame yet" if age is None else f"Last frame {_fmt_age(age)} ago")
         if data.get("robot_reachable"):
-            place = "on charger" if data.get("is_on_charger_platform") else "off charger"
+            if data.get("is_on_charger_platform"):
+                place = "on charger (charging)" if data.get("is_charging") else "on charger"
+            else:
+                place = "off charger"
             level = BATTERY_LEVELS.get(data.get("battery_level"), "unknown")
             lines.append(f"Battery {level}, {place}")
         return lines
@@ -117,24 +125,39 @@ class VectorCamera(CoordinatorEntity, Camera):
         return await self._status_image(frame)
 
     async def handle_async_mjpeg_stream(self, request: web.Request) -> web.StreamResponse | None:
+        assert request is not None and self._hub is not None
         hub = self._hub
         lease = hub.acquire()
-        last = [hub.seq]
-        status_sent = [False]
+        state = {"last": hub.seq, "status_sent": False, "status_frames": 0}
         wait_s = hub.cfg.header_timeout_s + hub.cfg.stall_timeout_s
 
         async def next_image() -> bytes | None:
-            got = await hub.next_frame(last[0], wait_s)
-            if got is not None:
-                last[0] = got[0]
-                return got[1]
-            if status_sent[0]:
-                return None
-            status_sent[0] = True
-            return await self._status_image(hub.frame)
+            return await self._next_stream_image(state, wait_s)
 
         try:
             return await async_get_still_stream(request, next_image, "image/jpeg",
                                                 LIVE_INTERVAL_S)
         finally:
             lease.release()
+
+    async def _next_stream_image(self, state: dict, wait_s: float) -> bytes | None:
+        assert wait_s > 0 and isinstance(state, dict)
+        hub = self._hub
+        got = None
+        if not state["status_sent"] or hub.can_start() or hub.state in (STATE_STARTING, STATE_STREAMING):
+            got = await hub.next_frame(state["last"], wait_s)
+        if got is not None:
+            state["last"], state["status_sent"], state["status_frames"] = got[0], False, 0
+            return got[1]
+        if not state["status_sent"]:
+            state["status_sent"] = True
+            state["status_frames"] = 1
+            return await self._status_image(hub.frame)
+        if state["status_frames"] >= MAX_STREAM_STATUS_FRAMES:
+            return None
+        got = await hub.wait_wake(state["last"], STATUS_KEEPALIVE_S)
+        if got is not None:
+            state["last"], state["status_sent"], state["status_frames"] = got[0], False, 0
+            return got[1]
+        state["status_frames"] += 1
+        return await self._status_image(hub.frame)

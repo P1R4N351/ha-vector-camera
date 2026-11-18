@@ -5,7 +5,7 @@ touched. Each arm's needle must occur exactly once and change the file, or the
 arm is reported SETUP-ERROR, never as a verdict. A suite that does not finish
 in time is reported TIMEOUT, separately from CAUGHT.
 
-Run: python3 skills/ha-vector-camera/tests/mutate.py   (needs aiohttp, Pillow)
+Run: python3 tests/mutate.py   (needs aiohttp, Pillow)
 """
 
 from __future__ import annotations
@@ -30,6 +30,10 @@ ARMS: list[tuple[str, list[tuple[str, str]]]] = [
     ("upstream kept open after last viewer leaves",
      [("        if self._viewers == 0:\n            self._stop()\n",
        "        if self._viewers == 0:\n            pass\n")]),
+    ("last viewer release leaves state streaming",
+     [("        if self._viewers == 0:\n            self._stop()\n"
+       "            if self._state in (STATE_STARTING, STATE_STREAMING):",
+       "        if self._viewers == 0:\n            self._stop()\n            if False:")]),
     ("no deadline on the start",
      [("        async with asyncio.timeout(cfg.header_timeout_s):\n            resp =",
        "        async with asyncio.timeout(None):\n            resp ="),
@@ -50,6 +54,9 @@ ARMS: list[tuple[str, list[tuple[str, str]]]] = [
      [("return (self._allowed and self._reachable", "return (True and self._reachable")]),
     ("unreachable robot still asked",
      [("return (self._allowed and self._reachable", "return (self._allowed and True")]),
+    ("unreachable recovery clears withheld state",
+     [("            if self._allowed:\n                self._set_state(STATE_ROBOT_UNREACHABLE",
+       "            if True:\n                self._set_state(STATE_ROBOT_UNREACHABLE")]),
     ("still ignores its cache",
      [("if self._frame is not None and age is not None and age <= max_age_s:", "if False:")]),
     ("still refreshes when told not to",
@@ -58,6 +65,17 @@ ARMS: list[tuple[str, list[tuple[str, str]]]] = [
      [("self._finish(self._seq - seq_before, failure)", "self._finish(0, failure)")]),
     ("wire-pod error text read as a stream",
      [('        if "multipart" not in ctype.lower():\n', "        if False:\n")]),
+    ("cam-stream non-200 drops error body",
+     [('            msg = f"cam-stream: http {resp.status}: {body}" if body else f"cam-stream: http {resp.status}"\n',
+       '            msg = f"cam-stream: http {resp.status}"\n')]),
+    ("get_battery ignores HTTP status",
+     [("        if resp.status != 200:\n            detail = text.strip()[:120]",
+       "        if False:\n            detail = text.strip()[:120]")]),
+    ("get_battery drops false on_charger default",
+     [('    out["is_on_charger_platform"] = bool(data.get("is_on_charger_platform", False))\n',
+       '    out["is_on_charger_platform"] = data.get("is_on_charger_platform")\n')]),
+    ("JPEG header segment EOI truncates frame",
+     [("            end = _find_jpeg_end(self._buf)\n", "            end = _scan_eoi(self._buf, 2)\n")]),
     ("tiny marker pair accepted as a frame",
      [("            if len(frame) >= MIN_FRAME_BYTES:\n", "            if True:\n")]),
     ("oversized frame never discarded",
@@ -76,6 +94,7 @@ NEUTRAL = ("comment only (must survive)",
 
 
 def run_suite(root: pathlib.Path) -> str:
+    assert root.is_dir()
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", "discover", "-s", str(root / "tests")],
@@ -86,6 +105,7 @@ def run_suite(root: pathlib.Path) -> str:
 
 
 def apply(path: pathlib.Path, pairs: list[tuple[str, str]]) -> str:
+    assert path.is_file() and len(pairs) >= 1
     text = path.read_text()
     for old, new in pairs:
         if old == new:
@@ -112,9 +132,10 @@ def arm(name: str, pairs: list[tuple[str, str]], pristine: str, root: pathlib.Pa
 
 
 def main() -> int:
+    assert SKILL.is_dir() and (SKILL / TARGET).is_file()
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp) / "skill"
-        shutil.copytree(SKILL, root, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(SKILL, root, ignore=shutil.ignore_patterns("__pycache__", ".git"))
         pristine = (root / TARGET).read_text()
         if run_suite(root) != "PASS":
             print("SETUP-ERROR  control: suite does not pass on the pristine copy")

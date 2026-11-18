@@ -17,6 +17,8 @@ WRAP_CHARS = 52
 
 def render(lines: list[str], frame: bytes | None = None) -> bytes:
     """A JPEG: the last frame darkened with a banner, or a dark card."""
+    assert isinstance(lines, (list, tuple))
+    assert WIDTH > 0 and HEIGHT > 0
     if frame is not None:
         try:
             img = Image.open(io.BytesIO(frame)).convert("RGB").resize((WIDTH, HEIGHT))

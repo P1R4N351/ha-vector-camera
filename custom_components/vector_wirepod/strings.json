@@ -10,21 +10,33 @@
         "title": "Robot",
         "description": "Choose the robot. The camera is added even while the robot sleeps; it shows its status until frames arrive.",
         "data": {"serial": "Robot (serial)", "name": "Name (optional)"}
+      },
+      "reconfigure": {
+        "title": "Update wire-pod server",
+        "description": "Change the wire-pod URL for this robot without removing existing entities or history.",
+        "data": {"wirepod_url": "wire-pod URL"}
       }
     },
     "error": {
       "cannot_connect": "wire-pod did not answer, or answered with something other than its robot list.",
       "invalid_url": "The URL must start with http:// or https://.",
-      "no_robots": "wire-pod has no paired robots."
+      "no_robots": "wire-pod has no paired robots.",
+      "robot_not_on_server": "That wire-pod server does not list this robot's serial."
     },
-    "abort": {"already_configured": "This robot is already set up."}
+    "abort": {
+      "already_configured": "This robot is already set up.",
+      "reconfigure_successful": "wire-pod server updated."
+    }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Thumbnail refresh",
+        "title": "Polling and thumbnails",
         "description": "Each thumbnail refresh opens the robot's camera briefly and, when it closes, wire-pod turns the camera stream off, which also interrupts any other camera user. 0 means thumbnails update only while someone watches live.",
-        "data": {"still_refresh_s": "Minimum seconds between thumbnail refreshes"}
+        "data": {
+          "still_refresh_s": "Minimum seconds between thumbnail refreshes",
+          "battery_poll_s": "Battery and charger poll interval (seconds)"
+        }
       }
     }
   }
