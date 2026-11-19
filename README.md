@@ -86,7 +86,7 @@ triggers:
 actions:
   - action: switch.turn_on
     target:
-      entity_id: switch.vector_c7k8_quiet_mode
+      entity_id: switch.vector_demo_quiet_mode
 ```
 
 ## Tests
