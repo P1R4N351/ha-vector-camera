@@ -5,9 +5,25 @@ on its own.
 
 What "compliant with Vector" means here, each point enforced in this file:
 
-1. Read only. The only wire-pod paths ever requested are ALLOWED_PATHS. No
-   motion, speech, LED, or state-changing endpoints. Nothing here can wake the
-   robot or take it from what it is doing.
+1. Read only, with named exceptions. The only wire-pod paths ever requested
+   are ALLOWED_PATHS. The exceptions that change the robot's state are quiet
+   mode and, since 2026-11-19/2026-11-20 at the owner's request, fixed intents
+   sent only when a person presses a button (or the sleep cycle repeats sleep):
+   go to the charger (INTENT_DOCK), go to sleep (INTENT_SLEEP), explore
+   (INTENT_EXPLORE), listen for beat (INTENT_LISTEN_FOR_BEAT), and fetch cube
+   (INTENT_FETCH_CUBE), plus trigger_wake_word (/api-sdk/trigger_wake_word).
+   The sleep cycle (sleepcycle.py) repeats INTENT_SLEEP after a wake. The face
+   backlight level can be set (get_backlight / set_backlight), a number from
+   0 to 20 and nothing else. The master volume can be read (`get_volume` via
+   /api-sdk/get_sdk_settings) and set (`set_volume` via /api-sdk/volume), an
+   integer 0 to 5 (`mute` to `high`) and nothing else. Since 2026-11-20, also
+   at the owner's request, the microphones can be muted or unmuted
+   (get_mic_mute / set_mic_mute); the pod restarts the robot's programs to
+   apply a change. For Cryosleep overnight mute without restarting the robot's
+   programs or lighting privacy LEDs, get_cryo_mute / set_cryo_mute toggle
+   /api-sdk/cryo_mute (pod voice-stream gate + runtime consolevars/Wwise audio).
+   No other intent, no motion or speech endpoint can be requested through
+   this file.
 2. One upstream per robot. wire-pod serves one camera viewer per robot and
    ends the previous one when a new one arrives, so every viewer shares a
    single /cam-stream connection, opened only while someone is watching and
@@ -15,8 +31,10 @@ What "compliant with Vector" means here, each point enforced in this file:
 3. Every wait has a deadline. wire-pod sends no headers until the robot starts
    its camera, and a sleeping robot never does. A start that yields no frame
    within header_timeout_s is abandoned.
-4. A sleeping robot is asked rarely. Each failed start doubles the wait before
-   the next one, from backoff_min_s to backoff_max_s. Each abandoned start
+4. A sleeping robot is not asked. When the pod reports the robot asleep (or
+   about to sleep) nothing is opened: it gives no frames. Where that is not
+   known, each failed start doubles the wait before the next one, from
+   backoff_min_s to backoff_max_s. Each abandoned start
    leaves a blocked request inside wire-pod (its handler has no deadline), so
    this bounds that cost too.
 5. The camera can be withheld. When not allowed (for example during a
@@ -35,7 +53,34 @@ from urllib.parse import quote
 
 import aiohttp
 
-ALLOWED_PATHS = ("/api-sdk/get_sdk_info", "/api-sdk/get_battery", "/api-sdk/quiet_mode", "/cam-stream")
+ALLOWED_PATHS = ("/api-sdk/get_sdk_info", "/api-sdk/get_battery", "/api-sdk/quiet_mode", "/cam-stream",
+                 "/api-sdk/cloud_intent", "/api-sdk/robot_state", "/api-sdk/backlight", "/api-sdk/mic_mute",
+                 "/api-sdk/cryo_mute", "/api-sdk/trigger_wake_word", "/api-sdk/get_sdk_settings", "/api-sdk/volume")
+BACKLIGHT_MAX = 20
+VOLUME_MIN = 0
+VOLUME_MAX = 5
+VOLUME_NAMES = ("mute", "low", "medium_low", "medium", "medium_high", "high")
+ROBOT_STATE_FLAGS = ("asleep", "on_charger", "charging", "picked_up", "being_held",
+                     "button_pressed", "moving", "animating", "cliff_detected")
+INTENT_DOCK = "intent_system_charger"
+INTENT_SLEEP = "intent_system_sleep"
+INTENT_EXPLORE = "explore_start"
+INTENT_LISTEN_FOR_BEAT = "intent_imperative_dance"
+INTENT_FETCH_CUBE = "intent_imperative_fetchcube"
+ALLOWED_INTENTS = (
+    INTENT_DOCK,
+    INTENT_SLEEP,
+    INTENT_EXPLORE,
+    INTENT_LISTEN_FOR_BEAT,
+    INTENT_FETCH_CUBE,
+)
+STIMULATE_BUTTON_SPECS = (
+    ("explore", "Explore", "mdi:compass-outline", INTENT_EXPLORE),
+    ("listen_for_beat", "Listen for beat", "mdi:music-note", INTENT_LISTEN_FOR_BEAT),
+    ("go_to_sleep", "Go to sleep", "mdi:sleep", INTENT_SLEEP),
+    ("fetch_cube", "Fetch cube", "mdi:cube-outline", INTENT_FETCH_CUBE),
+)
+WAKE_WORD_BUTTON_SPEC = ("trigger_wake_word", "Trigger wake word", "mdi:account-voice")
 
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
@@ -52,6 +97,7 @@ STATE_STREAMING = "streaming"
 STATE_NO_FRAMES = "no_frames"
 STATE_WITHHELD = "withheld"
 STATE_ROBOT_UNREACHABLE = "robot_unreachable"
+STATE_ASLEEP = "robot_asleep"
 ALL_STATES = (
     STATE_IDLE,
     STATE_STARTING,
@@ -59,6 +105,7 @@ ALL_STATES = (
     STATE_NO_FRAMES,
     STATE_WITHHELD,
     STATE_ROBOT_UNREACHABLE,
+    STATE_ASLEEP,
 )
 
 
@@ -66,8 +113,32 @@ class WirePodError(Exception):
     """wire-pod answered, but not with what was asked for."""
 
 
+def _append_device_args(url: str, path: str, serial: str | None, *, level: int | None,
+                        muted: bool | None, volume: int | None) -> str:
+    """Validate and append backlight, mic_mute, or volume query arguments."""
+    if level is not None:
+        if (path != "/api-sdk/backlight" or serial is None or isinstance(level, bool)
+                or not isinstance(level, int) or not 0 <= level <= BACKLIGHT_MAX):
+            raise ValueError(f"level only valid on backlight, 0 to {BACKLIGHT_MAX}: {path!r} {level!r}")
+        url += f"&level={level}"
+    if muted is not None:
+        if path not in ("/api-sdk/mic_mute", "/api-sdk/cryo_mute") or serial is None or not isinstance(muted, bool):
+            raise ValueError(f"muted only valid on mic_mute or cryo_mute with serial: {path!r} {muted!r}")
+        url += "&muted=" + ("true" if muted else "false")
+    if (volume is not None) != (path == "/api-sdk/volume"):
+        raise ValueError(f"volume is required on volume and nowhere else: {path!r}")
+    if volume is not None:
+        if (serial is None or isinstance(volume, bool)
+                or not isinstance(volume, int) or not VOLUME_MIN <= volume <= VOLUME_MAX):
+            raise ValueError(f"volume must be int {VOLUME_MIN} to {VOLUME_MAX} with serial: {volume!r}")
+        url += f"&volume={volume}"
+    return url
+
+
 def build_url(base_url: str, path: str, serial: str | None = None,
-              *, enable: bool | None = None) -> str:
+              *, enable: bool | None = None, intent: str | None = None,
+              level: int | None = None, muted: bool | None = None,
+              volume: int | None = None) -> str:
     """Return a wire-pod URL. Refuses any path outside ALLOWED_PATHS."""
     if path not in ALLOWED_PATHS:
         raise ValueError(f"path not allowed: {path!r}")
@@ -78,11 +149,21 @@ def build_url(base_url: str, path: str, serial: str | None = None,
         if not serial.isalnum():
             raise ValueError(f"invalid serial: {serial!r}")
         url += "?serial=" + quote(serial)
+    if path == "/api-sdk/trigger_wake_word" and serial is None:
+        raise ValueError("serial is required on trigger_wake_word")
+    if path == "/api-sdk/get_sdk_settings" and serial is None:
+        raise ValueError("serial is required on get_sdk_settings")
     if enable is not None:
         if path != "/api-sdk/quiet_mode" or serial is None or not isinstance(enable, bool):
             raise ValueError(f"enable only valid on quiet_mode with serial: {path!r}")
         url += "&enable=" + ("true" if enable else "false")
-    return url
+    if (intent is not None) != (path == "/api-sdk/cloud_intent"):
+        raise ValueError(f"intent is required on cloud_intent and nowhere else: {path!r}")
+    if intent is not None:
+        if serial is None or intent not in ALLOWED_INTENTS:
+            raise ValueError(f"intent not allowed: {intent!r}")
+        url += "&intent=" + quote(intent)
+    return _append_device_args(url, path, serial, level=level, muted=muted, volume=volume)
 
 
 async def get_sdk_info(session: aiohttp.ClientSession, base_url: str,
@@ -179,6 +260,241 @@ async def set_quiet_mode(session: aiohttp.ClientSession, base_url: str, serial: 
     out = await _quiet_http_json(session, "POST", url, timeout_s, allow_404=False)
     assert isinstance(out, dict)
     return out
+
+
+async def send_intent(session: aiohttp.ClientSession, base_url: str, serial: str,
+                      intent: str, timeout_s: float = 15.0) -> None:
+    """Ask the robot, through wire-pod, to carry out one of ALLOWED_INTENTS."""
+    assert timeout_s > 0
+    url = build_url(base_url, "/api-sdk/cloud_intent", serial, intent=intent)
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.get(url, timeout=tmo) as resp:
+        text = (await resp.text()).strip()
+        if resp.status != 200 or text != "done":
+            raise WirePodError(f"cloud_intent: http {resp.status}: {text[:120]}")
+
+
+async def trigger_wake_word(session: aiohttp.ClientSession, base_url: str, serial: str,
+                            timeout_s: float = 15.0) -> None:
+    """Trigger the robot's 'Hey Vector' wake word through wire-pod."""
+    assert timeout_s > 0 and isinstance(serial, str)
+    url = build_url(base_url, "/api-sdk/trigger_wake_word", serial)
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.post(url, timeout=tmo) as resp:
+        text = (await resp.text()).strip()
+        if resp.status != 200 or text != "success":
+            raise WirePodError(f"trigger_wake_word: http {resp.status}: {text[:120]}")
+
+
+async def get_volume(session: aiohttp.ClientSession, base_url: str, serial: str,
+                     timeout_s: float = 15.0) -> int | None:
+    """Read the robot's master volume (0..5) from wire-pod's get_sdk_settings."""
+    assert timeout_s > 0 and isinstance(serial, str)
+    url = build_url(base_url, "/api-sdk/get_sdk_settings", serial)
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.get(url, timeout=tmo) as resp:
+        text = await resp.text()
+        if resp.status == 404:
+            return None
+        if resp.status != 200:
+            raise WirePodError(f"get_volume: http {resp.status}: {text.strip()[:120]}")
+    stripped = text.strip()
+    if stripped.startswith("error"):
+        raise WirePodError(f"get_volume: {stripped[:160]}")
+    try:
+        data = json.loads(stripped)
+    except ValueError as exc:
+        raise WirePodError(f"get_volume: not JSON: {stripped[:80]!r}") from exc
+    vol = data.get("master_volume") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or isinstance(vol, bool) or not isinstance(vol, int) or not VOLUME_MIN <= vol <= VOLUME_MAX:
+        raise WirePodError("get_volume: invalid master_volume")
+    return vol
+
+
+async def set_volume(session: aiohttp.ClientSession, base_url: str, serial: str, volume: int,
+                     timeout_s: float = 15.0) -> None:
+    """Set the robot's master volume (0 is mute, 5 is high) through wire-pod."""
+    assert timeout_s > 0 and isinstance(serial, str)
+    url = build_url(base_url, "/api-sdk/volume", serial, volume=volume)
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.post(url, timeout=tmo) as resp:
+        text = (await resp.text()).strip()
+        if resp.status != 200 or text != "done":
+            raise WirePodError(f"volume: http {resp.status}: {text[:120]}")
+
+
+async def _backlight_call(session: aiohttp.ClientSession, method: str, url: str,
+                          timeout_s: float) -> int | None:
+    """One backlight request. The level 0..BACKLIGHT_MAX, or None when this pod or robot offers
+    no backlight control (no such endpoint, no robot login configured, robot not known)."""
+    assert timeout_s > 0 and method in ("GET", "POST")
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.request(method, url, timeout=tmo) as resp:
+        text = await resp.text()
+        if resp.status in (404, 503):
+            return None
+        if resp.status != 200:
+            raise WirePodError(f"backlight: http {resp.status}: {text.strip()[:120]}")
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise WirePodError(f"backlight: not JSON: {text[:80]!r}") from exc
+    level = data.get("level") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or data.get("ok") is not True or isinstance(level, bool)
+            or not isinstance(level, int) or not 0 <= level <= 255):
+        raise WirePodError("backlight: invalid answer")
+    return min(level, BACKLIGHT_MAX)
+
+
+async def get_backlight(session: aiohttp.ClientSession, base_url: str, serial: str,
+                        timeout_s: float = 15.0) -> int | None:
+    """The face backlight level, read from the robot through the pod."""
+    return await _backlight_call(session, "GET", build_url(base_url, "/api-sdk/backlight", serial), timeout_s)
+
+
+async def set_backlight(session: aiohttp.ClientSession, base_url: str, serial: str, level: int,
+                        timeout_s: float = 15.0) -> int | None:
+    """Set the face backlight (0 is off). Returns the level the robot reports afterwards."""
+    url = build_url(base_url, "/api-sdk/backlight", serial, level=level)
+    return await _backlight_call(session, "POST", url, timeout_s)
+
+
+async def _mute_http_json(session: aiohttp.ClientSession, label: str, method: str, url: str,
+                          timeout_s: float, *, accept_503: bool) -> dict | None:
+    """Shared GET/POST JSON helper for mic_mute and cryo_mute."""
+    assert timeout_s > 0 and method in ("GET", "POST")
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.request(method, url, timeout=tmo) as resp:
+        text = await resp.text()
+        if resp.status == 404 or (accept_503 and resp.status == 503):
+            return None
+        if resp.status != 200:
+            try:
+                code = json.loads(text).get("error")
+            except (ValueError, AttributeError):
+                code = None
+            raise WirePodError(f"{label}: http {resp.status}: {code or text.strip()[:120]}")
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise WirePodError(f"{label}: not JSON: {text[:80]!r}") from exc
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        raise WirePodError(f"{label}: invalid answer")
+    return data
+
+
+async def _mic_mute_call(session: aiohttp.ClientSession, method: str, url: str,
+                         timeout_s: float) -> dict | None:
+    """One mic_mute request: {'muted': bool, 'restarting': bool}, or None when unavailable."""
+    data = await _mute_http_json(session, "mic_mute", method, url, timeout_s, accept_503=True)
+    if data is None:
+        return None
+    if not isinstance(data.get("muted"), bool) or not isinstance(data.get("restarting"), bool):
+        raise WirePodError("mic_mute: invalid answer")
+    return {"muted": data["muted"], "restarting": data["restarting"]}
+
+
+async def get_mic_mute(session: aiohttp.ClientSession, base_url: str, serial: str,
+                       timeout_s: float = 15.0) -> dict | None:
+    """Whether the robot's microphones are muted, read from the robot through the pod."""
+    return await _mic_mute_call(session, "GET", build_url(base_url, "/api-sdk/mic_mute", serial), timeout_s)
+
+
+async def set_mic_mute(session: aiohttp.ClientSession, base_url: str, serial: str, muted: bool,
+                       timeout_s: float = 15.0) -> dict | None:
+    """Mute or unmute the microphones. 'restarting' is True when the pod restarted the robot's
+    programs to apply the change (the camera and every robot call fail until they are back)."""
+    url = build_url(base_url, "/api-sdk/mic_mute", serial, muted=muted)
+    return await _mic_mute_call(session, "POST", url, timeout_s)
+
+
+async def _cryo_mute_call(session: aiohttp.ClientSession, method: str, url: str,
+                          timeout_s: float) -> dict | None:
+    """One cryo_mute request: {'muted': bool, 'pod_gated': bool, 'robot_muted': bool}, or None on 404."""
+    data = await _mute_http_json(session, "cryo_mute", method, url, timeout_s, accept_503=False)
+    if data is None:
+        return None
+    if (not isinstance(data.get("muted"), bool) or not isinstance(data.get("pod_gated"), bool)
+            or not isinstance(data.get("robot_muted"), bool)):
+        raise WirePodError("cryo_mute: invalid answer")
+    return {"muted": data["muted"], "pod_gated": data["pod_gated"], "robot_muted": data["robot_muted"]}
+
+
+async def get_cryo_mute(session: aiohttp.ClientSession, base_url: str, serial: str,
+                        timeout_s: float = 15.0) -> dict | None:
+    """Read Cryosleep runtime mute state (pod voice gate + robot console state)."""
+    return await _cryo_mute_call(session, "GET", build_url(base_url, "/api-sdk/cryo_mute", serial), timeout_s)
+
+
+async def set_cryo_mute(session: aiohttp.ClientSession, base_url: str, serial: str, muted: bool,
+                        timeout_s: float = 15.0) -> dict | None:
+    """Apply or release Cryosleep runtime mute without restarting anki-robot.target."""
+    url = build_url(base_url, "/api-sdk/cryo_mute", serial, muted=muted)
+    return await _cryo_mute_call(session, "POST", url, timeout_s)
+
+
+def _normalize_robot_state(data: object) -> dict:
+    """Keep only the known flags, each a real boolean."""
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        raise WirePodError("robot_state: not an ok answer")
+    out: dict = {}
+    for flag in ROBOT_STATE_FLAGS:
+        if not isinstance(data.get(flag), bool):
+            raise WirePodError(f"robot_state: invalid {flag}")
+        out[flag] = data[flag]
+    return out
+
+
+async def get_robot_state(session: aiohttp.ClientSession, base_url: str, serial: str,
+                          timeout_s: float = 10.0) -> dict | None:
+    """The robot's own status flags (asleep, picked up, ...). Read only.
+
+    None when this pod has no such endpoint (404). Raises WirePodError when the pod answers
+    but the robot gave no state.
+    """
+    assert timeout_s > 0
+    url = build_url(base_url, "/api-sdk/robot_state", serial)
+    tmo = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.get(url, timeout=tmo) as resp:
+        text = await resp.text()
+        if resp.status == 404:
+            return None
+        if resp.status != 200:
+            raise WirePodError(f"robot_state: http {resp.status}: {text.strip()[:120]}")
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise WirePodError(f"robot_state: not JSON: {text[:80]!r}") from exc
+    return _normalize_robot_state(data)
+
+
+def jpeg_size(data: bytes | None) -> tuple[int, int] | None:
+    """(width, height) of a JPEG read from its own header, or None. Vector 1.0 sends 16:9 frames
+    and Vector 2.0 sends 4:3, so nothing here may assume a shape."""
+    if not data or bytes(data[:2]) != SOI:
+        return None
+    pos, n = 2, len(data)
+    for _ in range(MAX_JPEG_SEGMENTS):
+        if pos + 4 > n or data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xFF:
+            pos += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            pos += 2
+            continue
+        seg_len = (data[pos + 2] << 8) | data[pos + 3]
+        if seg_len < 2 or marker == 0xDA:
+            return None
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if pos + 9 > n:
+                return None
+            height = (data[pos + 5] << 8) | data[pos + 6]
+            width = (data[pos + 7] << 8) | data[pos + 8]
+            return (width, height) if width > 0 and height > 0 else None
+        pos += 2 + seg_len
+    return None
 
 
 async def get_battery(session: aiohttp.ClientSession, base_url: str, serial: str,
@@ -341,6 +657,7 @@ class CameraHub:
         self._viewers = 0
         self._allowed = True
         self._reachable = True
+        self._asleep = False
         self._unreachable_detail = ""
         self._task: asyncio.Task | None = None
         self._frame: bytes | None = None
@@ -354,6 +671,8 @@ class CameraHub:
         self.dropped_frames = 0
         self._changed = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
+        self._size: tuple[int, int] | None = None
+        self._size_seq = -1
 
     # ---- read-only view -------------------------------------------------
     @property
@@ -385,11 +704,24 @@ class CameraHub:
             return None
         return max(0.0, self._clock() - self._frame_at)
 
+    def frame_size(self) -> tuple[int, int] | None:
+        """(width, height) of the newest frame; the last known shape when there is none."""
+        if self._size_seq != self._seq and self._frame is not None:
+            self._size = jpeg_size(self._frame) or self._size
+            self._size_seq = self._seq
+        return self._size
+
+    def seed_frame_size(self, size: tuple[int, int]) -> None:
+        """Remember a shape learnt earlier (before a restart) until a real frame arrives."""
+        assert len(size) == 2 and size[0] > 0 and size[1] > 0
+        if self._size is None:
+            self._size = (int(size[0]), int(size[1]))
+
     def retry_in_s(self) -> float:
         return max(0.0, self._retry_at - self._clock())
 
     def can_start(self) -> bool:
-        return (self._allowed and self._reachable
+        return (self._allowed and self._reachable and not self._asleep
                 and self._clock() >= self._retry_at)
 
     def diagnostics(self) -> dict:
@@ -399,6 +731,7 @@ class CameraHub:
             "detail": self._detail,
             "allowed": self._allowed,
             "reachable": self._reachable,
+            "asleep": self._asleep,
             "viewers": self._viewers,
             "seq": self._seq,
             "frame_age_s": None if age is None else round(age, 1),
@@ -445,6 +778,31 @@ class CameraHub:
         else:
             self._reconcile_resting_state()
             self._maybe_start()
+
+    def set_robot_asleep(self, asleep: bool) -> None:
+        """Told by the caller when the robot sleeps or is about to. Nothing is opened meanwhile."""
+        want = bool(asleep)
+        if want == self._asleep:
+            return
+        self._asleep = want
+        if want:
+            self._stop()
+            if self._allowed and self._reachable:
+                self._set_state(STATE_ASLEEP, "robot asleep; the camera is not opened")
+        elif self._state == STATE_ASLEEP:
+            self._fails = 0
+            self._retry_at = 0.0
+            self._reconcile_resting_state()
+            self._maybe_start()
+
+    def retry_now(self) -> None:
+        """Forget the wait after failed starts. For when a person asks for a picture, or there is
+        news that the robot has just woken."""
+        self._fails = 0
+        self._retry_at = 0.0
+        if self._state == STATE_NO_FRAMES:
+            self._reconcile_resting_state()
+        self._maybe_start()
 
     def set_robot_reachable(self, reachable: bool, detail: str = "") -> None:
         self._reachable = bool(reachable)
@@ -550,6 +908,8 @@ class CameraHub:
             self._set_state(STATE_WITHHELD, "camera withheld by switch")
         elif not self._reachable:
             self._set_state(STATE_ROBOT_UNREACHABLE, self._unreachable_detail or "robot not answering")
+        elif self._asleep:
+            self._set_state(STATE_ASLEEP, "robot asleep; the camera is not opened")
         elif self._retry_at > self._clock():
             if self._state != STATE_NO_FRAMES:
                 self._set_state(STATE_NO_FRAMES, f"waiting; next try in {int(self.retry_in_s())} s")

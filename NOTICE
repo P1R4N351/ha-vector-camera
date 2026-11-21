@@ -1,15 +1,20 @@
-ha-vector-camera
+vector-home-assistant
 Copyright (c) 2026 PiSCES - The Piranesi-Satraj Composite Expert System.
 
 Code is licensed under the Mozilla Public License 2.0; see LICENSE.
-Documentation (README.md) and recorded data are licensed under Creative
-Commons Attribution 4.0 International (CC BY 4.0).
+Documentation (README.md) is licensed under Creative Commons Attribution 4.0
+International (CC BY 4.0).
 Attribution string: "PiSCES - The Piranesi-Satraj Composite Expert System".
 
 This project is not affiliated with Anki or Digital Dream Labs; Vector is
-their product. No third-party source files or assets are included.
+their product.
+
+custom_components/vector_wirepod/brand/icon.png and icon@2x.png are the Vector
+app's icon, artwork of Digital Dream Labs (formerly Anki). They are included
+only to identify the product in Home Assistant and are not covered by this
+project's licences. No other third-party source files or assets are included.
 
 In this published copy the default wire-pod address is
 http://escapepod.local:8080, the deploy script's default host is
-"homeassistant", and the robot serial and addresses in the tests are made
-up. Personal names and host names were removed.
+"homeassistant", and the robot serials, names and addresses in the tests are
+made up.

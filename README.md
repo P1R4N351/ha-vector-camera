@@ -1,125 +1,153 @@
----
-name: ha-vector-camera
-description: Home Assistant custom integration (vector_wirepod) that shows a Vector robot's camera through wire-pod without waking, driving or fighting the robot.
----
+# Vector for Home Assistant
 
-# ha-vector-camera
+A Home Assistant custom integration for Vector robots (Anki, later Digital Dream Labs) that are
+served by [wire-pod](https://github.com/kercre123/wire-pod). One config entry per robot. Domain
+`vector_wirepod`.
 
-Authored-by: CPCS.
+Not affiliated with Anki or Digital Dream Labs.
 
-A Home Assistant integration for one Vector's camera and passive telemetry, served
-through wire-pod. It is written around how Vector and wire-pod actually behave,
-measured against live wire-pod and Home Assistant hosts.
+## What each robot gets
 
-## What it does to the robot, and what it never does
+**Camera and photos**
 
-| Rule | Why |
+| Entity | Notes |
 |---|---|
-| Only `get_sdk_info`, `get_battery`, `quiet_mode` (when toggled or polled), and `/cam-stream` are ever requested; a test fails if any other wire-pod path appears in the source. | Passive by default: polling never wakes, drives, or interrupts the robot. Enabling `Quiet mode` asks wire-pod's persistent supervisor to hold `RESERVE_CONTROL` and mute audio to suppress autonomous roaming, expressions, and wake-word reactions while leaving emergency cliff/low-battery safety active. |
-| All HA viewers share one `/cam-stream` connection, opened only while someone watches live and closed when the last viewer leaves (returning camera state to `idle`). | wire-pod serves one viewer per robot and ends the previous one when a new one arrives. |
-| A start that yields no frame within 6 s is abandoned, then retried no sooner than 60 s later, doubling to 30 min. Waiting live streams keep a calm 5 s status keepalive instead of disconnecting and auto-recover when frames arrive. | An unpatched wire-pod waits on a robot that is not producing frames with no deadline, and browser reconnect storms otherwise hammer wire-pod. |
-| JPEG frames are bounded by walking ISO 10918-1 header segments (`APPn`/`COM`/`SOFn`/`SOS`). | Raw `EOI` byte scans split valid frames early whenever `APPn` or `COM` metadata contains `0xFF 0xD9`. |
-| Thumbnails come from the last frame. A fresh one is fetched at most every `still_refresh_s` (default 300, 0 = never), and only when a start is due. | Fewer feed opens and closes on the robot. |
-| It is meant to stay on during experiments and other processes: it only consumes frames and never commands the robot. | Operator requirement, 2026-11-14. |
-| Switch `Camera allowed` withholds the camera and closes a live stream. Its state survives restarts and is not overwritten by robot reachability polls. | For the rare case where even passive viewing must stop. |
-| When there is no fresh frame, the camera shows a status card (state, reason, age of the last frame, battery, charger) instead of a stale picture. | A stale frame or wire-pod's "NO LIVE VIDEO" image otherwise passes for live video. |
+| Camera | Live view and thumbnails in the robot's own frame shape (16:9 on Vector 1.0, 4:3 on 2.0). One wire-pod stream is shared by every viewer and closed when nobody watches. A sleeping robot sends no frames; the camera then shows its status instead of waking it. |
+| Camera allowed (switch) | Off closes the stream and keeps it closed, for runs where something else needs the camera. |
+| Take photo (button), Photo on wake (switch), Last photo (image) | Photos are kept in `www/vector_wirepod/<serial>/` (newest 50); each fires the event `vector_wirepod_photo`. |
+
+**Status**
+
+| Entity | Notes |
+|---|---|
+| Battery voltage, Battery level (sensors); On charger, Charging, Robot reachable (binary sensors) | Polled every 60 s by default. |
+| Asleep (binary sensor) | The robot's own flag. |
+| Picked up, Being held, Back button pressed, Moving, Animating, Edge detected (binary sensors) | The robot's own status flags, from the same reading as Asleep. Unknown, not off, when the robot cannot be read. |
+| Camera status, Sleep cycle (sensors) | Diagnostic. |
+
+**Robot data** (read every 15 minutes; reading changes nothing on the robot and does not wake it)
+
+| Entity | Source |
+|---|---|
+| Time switched on, Time petted (sensors) | Lifetime counters `Alive.seconds` and `Pet.ms`. Time switched on is powered time, not age. |
+| Distance driven (sensor) | `Odom.Body`, stored by the robot as millimetres × 100000. |
+| Wake word reactions (sensor) | `BStat.ReactedToTriggerWord`. |
+| Lifetime counters (diagnostic sensor) | Every lifetime counter, unchanged, as attributes. |
+| Locale, Time zone, Location, IP address (diagnostic sensors) | The robot's settings, and its address as wire-pod lists it. The robot's SDK token is never exposed. |
+
+Units are from the robot's own source (`engine/components/robotStatsTracker.cpp` in
+[wire-os-victor](https://github.com/os-vector/wire-os-victor)).
+
+**Actions and settings**
+
+| Entity | Notes |
+|---|---|
+| Dock, Sleep, Go to sleep, Explore, Listen for beat, Fetch cube, Trigger wake word (buttons) | Fixed wire-pod intents. Sleep starts a repeating cycle: sleep until woken, quiet mode for a set time (default 600 s), then sleep again. |
+| Quiet mode (switch) | Holds the robot still and quiet. |
+| Volume (number) | Master volume, 0 (mute) to 5 (high). |
+| Eye colour (select) | The seven preset colours, or Custom when the robot has a custom colour, which choosing it restores. |
+| Face backlight (light), Mute microphones (switch) | Need wire-pod to log in to the robot (developer robots). Changing the microphone mute restarts the robot's programs (about 20 s). |
+| Cryosleep (switch) | For overnight automations: turns off quiet mode and the controls above, mutes voice requests and the speaker without a restart, puts the robot to sleep, turns the face backlight off, keeps it asleep, and restores everything when switched off. |
+
+**Manual controls**
+
+| Entity | Notes |
+|---|---|
+| Drive forward, Drive backward, Turn left, Turn right (buttons) | One step each: 100 mm forward, 50 mm back, or 45° on the spot. |
+| Stop (button) | Stops the motors. Available whenever the robot is reachable. |
+| Head angle (−22° to 45°), Lift height (0 to 100 %) (numbers) | Show the last value set; wire-pod does not report either back. |
+| Say (text) | The robot says the text, up to 255 characters. |
+| Manual control (switch) | On while Home Assistant holds control of the robot. Off releases it at once. |
+
+How the manual controls behave:
+
+- Control is requested at DEFAULT priority, never `OVERRIDE_BEHAVIORS`, so the robot still reacts
+  to edges, falls and being picked up while it is driven.
+- Only fixed endpoints with range-checked arguments are sent.
+- The first command takes control and ends any running sleep cycle. Control is released 60 s
+  after the last command, because holding it keeps the robot awake.
+- The controls are refused during Quiet mode and Cryosleep, except Stop. Turning Cryosleep on
+  releases control.
+- Refusals from wire-pod (on the charger, an edge ahead, something in the way, being held) are
+  shown as errors in plain words.
+
+## Requirements
+
+- Home Assistant. Tested with 2026.11.2.
+- A wire-pod server that the robot is paired with, reachable from Home Assistant over HTTP.
+
+Stock wire-pod provides the camera, battery, intents, wake word, volume, robot data, eye colour,
+speech and behavior control. The entities below call endpoints that stock wire-pod does not
+have; on a stock server they are unavailable or report an error.
+
+| Endpoint | Used by |
+|---|---|
+| `/api-sdk/robot_state` | Asleep, the status flags, the sleep cycle |
+| `/api-sdk/quiet_mode` | Quiet mode, the sleep cycle |
+| `/api-sdk/backlight`, `/api-sdk/mic_mute` | Face backlight, Mute microphones |
+| `/api-sdk/cryo_mute` | Cryosleep |
+| `/api-sdk/drive_straight`, `turn_in_place`, `set_head_angle`, `set_lift_height`, `stop_motors` | The manual controls |
+
+On stock wire-pod a robot reflex (an edge, a fall) ends the control hold for good: turn
+Manual control off and on to take it back.
+[kercre123/wire-pod#550](https://github.com/kercre123/wire-pod/pull/550) proposes asking again
+automatically.
 
 ## Install
 
-### HACS (custom repository)
+- **HACS:** add this repository as a custom repository (type Integration), install **Vector**,
+  restart Home Assistant.
+- **By hand:** copy `custom_components/vector_wirepod/` (with its `brand/` folder) into the
+  `custom_components/` folder of your configuration, then restart.
+- **Supervised host over SSH:** `./deploy.sh --host <host> --restart`.
 
-1. In Home Assistant, open **HACS** -> menu -> **Custom repositories**.
-2. Add `https://github.com/P1R4N351/ha-vector-camera` with category **Integration**.
-3. Install **Vector (wire-pod) camera**, restart Home Assistant, then go to **Settings -> Devices & services -> Add integration**.
+Then add the integration under Settings → Devices & services, enter the wire-pod address
+(default `http://escapepod.local:8080`), and choose the robot. A sleeping robot can be added; its
+entities fill in as it answers.
 
-### Manual / SSH script
-
-```bash
-bash deploy.sh --host homeassistant --restart
-```
-
-`deploy.sh` copies `custom_components/vector_wirepod` into the HA config on the
-host (keeping any previous copy as `vector_wirepod.bak-<UTC>`), runs
-`ha core check`, and with `--restart` restarts HA core, which is needed to
-load new code. Setup reads only wire-pod's robot list, so a sleeping robot can
-be added. Use **Reconfigure** on the integration entry to change the wire-pod
-URL without losing entity history.
-
-## Entities
-
-- `camera.<name>`: attributes `camera_state` (`idle`, `starting`, `streaming`,
-  `no_frames`, `withheld`, `robot_unreachable`), `camera_detail`,
-  `camera_allowed`, `viewers`, `last_frame_age_s`, `next_start_in_s`,
-  `dropped_frames`, `robot_reachable`, `on_charger`, `charging`,
-  `battery_level`, `battery_volts`.
-- `switch.<name>_camera_allowed`: withholds the camera from Home Assistant.
-- `switch.<name>_quiet_mode`: slider toggle that engages/releases persistent
-  wire-pod `RESERVE_CONTROL` (`BehaviorSDKLock`) + audio mute so Vector stays
-  still and silent overnight or while away without autonomous roaming,
-  expressions, or reactions (requires `wire-pod` `/api-sdk/quiet_mode`; stays
-  available whenever `wire-pod` is up even while Vector sleeps). Attributes:
-  `active`, `holding_reserve`, `muted`, `robot_reachable`, `pending_restore`,
-  `last_error`.
-- `sensor.<name>_battery_voltage`: live voltage (`V`) from `get_battery`.
-- `sensor.<name>_battery_level`: enum (`unknown`, `low`, `nominal`, `full`).
-- `sensor.<name>_camera_status`: diagnostic enum mirroring `camera_state`.
-- `binary_sensor.<name>_on_charger`: charger platform presence (normalizing Go `omitempty` false fields).
-- `binary_sensor.<name>_charging`: active charging state.
-- `binary_sensor.<name>_robot_reachable`: diagnostic connectivity via wire-pod.
-
-Integration diagnostics download (`diagnostics.py`) exports redacted config,
-battery coordinator payload, and `CameraHub` counters.
-
-Battery and `quiet_mode` are polled every `battery_poll_s` seconds (default `60`,
-configurable in integration options). When wire-pod is unreachable the entities are
-unavailable; when wire-pod answers but the robot does not, the camera and
-diagnostics report `robot_unreachable` while `switch.<name>_quiet_mode` remains
-available so automations can still arm or clear Quiet mode.
-
-### Example overnight / extended-away Home Assistant automation
+## Example: Cryosleep overnight
 
 ```yaml
-alias: Vector Quiet Mode overnight
-triggers:
-  - trigger: time
-    at: "22:30:00"
-actions:
-  - action: switch.turn_on
-    target:
-      entity_id: switch.vector_demo_quiet_mode
+automation:
+  - alias: "Vector: overnight Cryosleep"
+    triggers:
+      - trigger: time
+        at: "23:00:00"
+        id: sleep
+      - trigger: time
+        at: "08:00:00"
+        id: wake
+    actions:
+      - action: >
+          {{ "switch.turn_on" if trigger.id == "sleep" else "switch.turn_off" }}
+        target:
+          entity_id: switch.vector_demo_cryosleep
 ```
+
+## Known limits
+
+- A wake is noticed at the next poll: up to 60 s late, or 20 s while a sleep cycle runs.
+- Under quiet mode the camera sends no frames, so a photo lifts quiet mode for the few seconds it
+  takes.
+- wire-pod answers `say_text` with "success" whether or not the robot spoke.
+- Holding control wakes a sleeping robot within about a second. Control is shared with
+  wire-pod's own web control page: releasing it from Home Assistant also ends a hold taken there.
+- The first command after control is taken waits 1.5 s, because wire-pod answers before the robot
+  has granted control.
+- Listening through the microphones is not offered. The SDK audio feed in current robot firmware
+  sends a 1 kHz test tone, not microphone audio (`engine/components/sdkComponent.cpp`).
 
 ## Tests
 
-```bash
-bash tests/check.sh                        # metadata + unit/entity tests + mutate.py
-bash tests/check.sh --quick                # metadata + unit/entity tests only
-python3 -m unittest discover -s tests -v   # needs aiohttp, Pillow
-python3 tests/mutate.py
+```sh
+tests/check.sh          # unit tests, then the mutation suite
+tests/check.sh --quick  # unit tests only
 ```
 
-- `tests/test_wirepod.py` runs `wirepod.py` and `placeholder.py` against a local
-  fake wire-pod that streams, injects APPn/COM `0xFF 0xD9` metadata, hangs,
-  stalls, ends early, returns HTTP 502/504 errors, or omits false `get_battery`
-  fields.
-- `tests/test_ha_entities.py` exercises `__init__.py`, `camera.py`, `switch.py`,
-  `sensor.py`, `binary_sensor.py`, `diagnostics.py`, `config_flow.py`
-  (including `reconfigure` and options), and integration metadata offline
-  against `FakeWirePod` using a stubbed `homeassistant` harness.
-- `tests/mutate.py` breaks one guard at a time in a scratch copy and checks
-  that the test suite catches every injected defect.
-- Live Home Assistant runtime UI verification requires an active HA instance
-  and an awake Vector robot connected to wire-pod.
+The tests run with aiohttp and Pillow; Home Assistant is used when installed and replaced by
+stand-ins otherwise. `tests/mutate.py` breaks one rule at a time and checks that a test fails.
 
-## Why passivity depends on wire-pod
+## Licence
 
-The robot's gateway turns image streaming on when a `CameraFeed` subscriber
-connects and off, for the whole robot, when any subscriber leaves
-(`vector-cloud` `gateway/message_handler.go`, `CameraFeed`). A wire-pod that
-opens a feed per viewer therefore silences every other camera user,
-including an experiment's SDK feed, each time an HA viewer closes.
-`kercre123/wire-pod#549` proposed a shared-feed proxy in wire-pod; if a
-single-viewer `handleCamStream` with idle timeout and streaming-ownership
-tracking is used instead, keep `Camera allowed` off during active navigation
-experiments (`still_refresh_s: 0`) so HA does not compete for the stream or
-re-open/close streaming mid-run.
+Code: Mozilla Public License 2.0 (`LICENSE`). Documentation: CC BY 4.0. The icon in
+`custom_components/vector_wirepod/brand/` is not covered by either; see `NOTICE`.

@@ -24,4 +24,8 @@ async def async_get_config_entry_diagnostics(
         "options": dict(entry.options),
         "coordinator": async_redact_data(dict(data.coordinator.data or {}), TO_REDACT),
         "hub": data.hub.diagnostics(),
+        "sleep_cycle": {"phase": data.manager.cycle.phase, "note": data.manager.cycle.note,
+                        "wakes": data.manager.cycle.wakes},
+        "cryosleep": data.manager.cryosleep.as_attributes(),
+        "last_photo_error": data.manager.last_photo_error,
     }

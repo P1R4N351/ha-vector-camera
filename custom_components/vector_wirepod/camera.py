@@ -1,5 +1,8 @@
 """Camera entity for one Vector, passive and shared. Authored-by: CPCS.
 
+Frames are passed on exactly as the robot sent them, whatever their shape: Vector 1.0 sends 16:9
+and Vector 2.0 sends 4:3. Status images take the same shape as the robot's frames.
+
 Thumbnails never open the robot's camera on their own schedule: they are served
 from the last frame, refreshed at most once per still_refresh_s and only when a
 start is due (see CameraHub.still). Opening the live view takes a lease on the
@@ -15,10 +18,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import placeholder
-from .const import (BATTERY_LEVELS, CONF_SERIAL, CONF_STILL_REFRESH_S,
+from . import hardware, placeholder
+from .const import (BATTERY_LEVELS, CONF_SERIAL, CONF_STILL_REFRESH_S, CONF_WIREPOD_URL,
                     DEFAULT_STILL_REFRESH_S, DOMAIN, MAX_STREAM_STATUS_FRAMES,
                     STATUS_KEEPALIVE_S, STILL_WAIT_S)
 from .wirepod import STATE_STARTING, STATE_STREAMING
@@ -34,8 +38,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
 
 def device_info(entry: ConfigEntry) -> DeviceInfo:
     serial = entry.data[CONF_SERIAL]
+    data = getattr(entry, "runtime_data", None)
+    size = data.hub.frame_size() if data is not None else None
+    maker, model = hardware.maker_and_model(serial, size)
     return DeviceInfo(identifiers={(DOMAIN, serial)}, name=entry.title,
-                      manufacturer="Digital Dream Labs", model="Vector", serial_number=serial)
+                      manufacturer=maker, model=model, serial_number=serial,
+                      configuration_url=entry.data.get(CONF_WIREPOD_URL))
 
 
 def _fmt_age(age: float) -> str:
@@ -46,7 +54,7 @@ def _fmt_age(age: float) -> str:
     return f"{age / 3600:.1f} h"
 
 
-class VectorCamera(CoordinatorEntity, Camera):
+class VectorCamera(CoordinatorEntity, Camera, RestoreEntity):
     _attr_has_entity_name = True
     _attr_name = None
 
@@ -63,6 +71,13 @@ class VectorCamera(CoordinatorEntity, Camera):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         self.async_on_remove(self._hub.add_listener(self.async_write_ha_state))
+        # The camera's shape (16:9 on Vector 1.0, 4:3 on 2.0) is learnt from frames; keep it
+        # over a restart so status images have the right shape before the first frame.
+        last = await self.async_get_last_state()
+        if last is not None:
+            width, height = last.attributes.get("frame_width"), last.attributes.get("frame_height")
+            if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+                self._hub.seed_frame_size((width, height))
 
     @property
     def is_streaming(self) -> bool:
@@ -74,7 +89,11 @@ class VectorCamera(CoordinatorEntity, Camera):
         hub = self._hub
         age = hub.frame_age_s()
         data = self.coordinator.data or {}
+        size = hub.frame_size()
         return {
+            "frame_width": size[0] if size else None,
+            "frame_height": size[1] if size else None,
+            "aspect_ratio": round(size[0] / size[1], 3) if size else None,
             "camera_state": hub.state,
             "camera_detail": hub.detail,
             "camera_allowed": hub.allowed,
@@ -112,7 +131,7 @@ class VectorCamera(CoordinatorEntity, Camera):
 
     async def _status_image(self, frame: bytes | None) -> bytes:
         return await self.hass.async_add_executor_job(
-            placeholder.render, self._status_lines(), frame)
+            placeholder.render, self._status_lines(), frame, self._hub.frame_size())
 
     async def async_camera_image(self, width: int | None = None,
                                  height: int | None = None) -> bytes | None:

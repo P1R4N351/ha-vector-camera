@@ -1,6 +1,6 @@
 {
   "domain": "vector_wirepod",
-  "name": "Vector (wire-pod) camera",
+  "name": "Vector",
   "codeowners": [
     "@P1R4N351"
   ],
@@ -8,10 +8,10 @@
   "dependencies": [
     "http"
   ],
-  "documentation": "https://github.com/P1R4N351/ha-vector-camera",
+  "documentation": "https://github.com/P1R4N351/vector-home-assistant",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/P1R4N351/ha-vector-camera/issues",
+  "issue_tracker": "https://github.com/P1R4N351/vector-home-assistant/issues",
   "requirements": [],
-  "version": "0.3.1"
+  "version": "0.12.0"
 }

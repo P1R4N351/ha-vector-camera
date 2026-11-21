@@ -15,9 +15,11 @@ from homeassistant.helpers.selector import (SelectOptionDict, SelectSelector,
                                             SelectSelectorConfig)
 
 from .const import (BATTERY_POLL_S, CONF_BATTERY_POLL_S, CONF_NAME,
-                    CONF_SERIAL, CONF_STILL_REFRESH_S, CONF_WIREPOD_URL,
+                    CONF_QUIET_HOLD_S, CONF_SERIAL, CONF_STILL_REFRESH_S,
+                    CONF_WIREPOD_URL, DEFAULT_QUIET_HOLD_S,
                     DEFAULT_STILL_REFRESH_S, DEFAULT_WIREPOD_URL, DOMAIN,
-                    MAX_BATTERY_POLL_S, MAX_STILL_REFRESH_S, MIN_BATTERY_POLL_S)
+                    MAX_BATTERY_POLL_S, MAX_QUIET_HOLD_S, MAX_STILL_REFRESH_S,
+                    MIN_BATTERY_POLL_S, MIN_QUIET_HOLD_S)
 from .wirepod import WirePodError, get_sdk_info
 
 
@@ -104,10 +106,13 @@ class VectorOptionsFlow(OptionsFlow):
             return self.async_create_entry(data=user_input)
         cur_refresh = self.config_entry.options.get(CONF_STILL_REFRESH_S, DEFAULT_STILL_REFRESH_S)
         cur_poll = self.config_entry.options.get(CONF_BATTERY_POLL_S, BATTERY_POLL_S)
+        cur_hold = self.config_entry.options.get(CONF_QUIET_HOLD_S, DEFAULT_QUIET_HOLD_S)
         schema = vol.Schema({
             vol.Required(CONF_STILL_REFRESH_S, default=cur_refresh):
                 vol.All(vol.Coerce(int), vol.Range(min=0, max=MAX_STILL_REFRESH_S)),
             vol.Required(CONF_BATTERY_POLL_S, default=cur_poll):
                 vol.All(vol.Coerce(int), vol.Range(min=MIN_BATTERY_POLL_S, max=MAX_BATTERY_POLL_S)),
+            vol.Required(CONF_QUIET_HOLD_S, default=cur_hold):
+                vol.All(vol.Coerce(int), vol.Range(min=MIN_QUIET_HOLD_S, max=MAX_QUIET_HOLD_S)),
         })
         return self.async_show_form(step_id="init", data_schema=schema)

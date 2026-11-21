@@ -3,18 +3,25 @@
     "step": {
       "user": {
         "title": "wire-pod server",
-        "description": "Address of the wire-pod server that the Vector is paired with. Only its robot list is read here; the camera is not opened.",
-        "data": {"wirepod_url": "wire-pod URL"}
+        "description": "Address of the wire-pod server that the Vector is paired with. Only its robot list is read here; nothing is sent to a robot.",
+        "data": {
+          "wirepod_url": "wire-pod URL"
+        }
       },
       "robot": {
         "title": "Robot",
-        "description": "Choose the robot. The camera is added even while the robot sleeps; it shows its status until frames arrive.",
-        "data": {"serial": "Robot (serial)", "name": "Name (optional)"}
+        "description": "Choose the robot. It is added even while it sleeps: its camera shows its status until frames arrive, and its other entities fill in as it answers.",
+        "data": {
+          "serial": "Robot (serial)",
+          "name": "Name (optional)"
+        }
       },
       "reconfigure": {
         "title": "Update wire-pod server",
         "description": "Change the wire-pod URL for this robot without removing existing entities or history.",
-        "data": {"wirepod_url": "wire-pod URL"}
+        "data": {
+          "wirepod_url": "wire-pod URL"
+        }
       }
     },
     "error": {
@@ -31,19 +38,84 @@
   "options": {
     "step": {
       "init": {
-        "title": "Polling and thumbnails",
+        "title": "Polling, thumbnails and sleep",
         "description": "Each thumbnail refresh opens the robot's camera briefly and, when it closes, wire-pod turns the camera stream off, which also interrupts any other camera user. 0 means thumbnails update only while someone watches live.",
         "data": {
           "still_refresh_s": "Minimum seconds between thumbnail refreshes",
-          "battery_poll_s": "Battery and charger poll interval (seconds)"
+          "battery_poll_s": "Battery and charger poll interval (seconds)",
+          "quiet_hold_s": "Quiet time after a wake, before sleep is asked for again (seconds)"
         }
       }
     }
   },
   "entity": {
     "switch": {
-      "camera_allowed": {"name": "Camera allowed"},
-      "quiet_mode": {"name": "Quiet mode"}
+      "cryosleep": {
+        "name": "Cryosleep"
+      },
+      "camera_allowed": {
+        "name": "Camera allowed"
+      },
+      "quiet_mode": {
+        "name": "Quiet mode"
+      },
+      "photo_on_wake": {
+        "name": "Photo on wake"
+      },
+      "mic_mute": {
+        "name": "Mute microphones"
+      }
+    },
+    "button": {
+      "dock": {
+        "name": "Dock"
+      },
+      "sleep": {
+        "name": "Sleep"
+      },
+      "explore": {
+        "name": "Explore"
+      },
+      "listen_for_beat": {
+        "name": "Listen for beat"
+      },
+      "go_to_sleep": {
+        "name": "Go to sleep"
+      },
+      "fetch_cube": {
+        "name": "Fetch cube"
+      },
+      "trigger_wake_word": {
+        "name": "Trigger wake word"
+      },
+      "take_photo": {
+        "name": "Take photo"
+      }
+    },
+    "binary_sensor": {
+      "asleep": {
+        "name": "Asleep"
+      }
+    },
+    "sensor": {
+      "sleep_cycle": {
+        "name": "Sleep cycle"
+      }
+    },
+    "image": {
+      "last_photo": {
+        "name": "Last photo"
+      }
+    },
+    "light": {
+      "face_backlight": {
+        "name": "Face backlight"
+      }
+    },
+    "number": {
+      "volume": {
+        "name": "Volume"
+      }
     }
   }
 }

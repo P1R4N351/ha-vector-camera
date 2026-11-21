@@ -12,6 +12,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .camera import device_info
 from .const import CONF_SERIAL
+from .extras import extra_binary_sensors
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
@@ -21,6 +22,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         VectorOnChargerBinarySensor(entry),
         VectorChargingBinarySensor(entry),
         VectorReachableBinarySensor(entry),
+        VectorAsleepBinarySensor(entry),
+        *extra_binary_sensors(entry),
     ])
 
 
@@ -76,3 +79,29 @@ class VectorReachableBinarySensor(_VectorBaseBinarySensor):
         if data is None:
             return None
         return bool(data.get("robot_reachable"))
+
+
+class VectorAsleepBinarySensor(_VectorBaseBinarySensor):
+    """On while the robot itself reports that it is asleep. Unknown when it cannot be read."""
+
+    def __init__(self, entry: ConfigEntry) -> None:
+        super().__init__(entry, "asleep", "Asleep")
+
+    def _state(self) -> dict | None:
+        data = self.coordinator.data or {}
+        state = data.get("robot_state")
+        return state if data.get("robot_reachable") and isinstance(state, dict) else None
+
+    @property
+    def icon(self) -> str:
+        return "mdi:sleep" if self.is_on else "mdi:sleep-off"
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self._state()
+        return None if state is None else bool(state.get("asleep"))
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        state = self._state() or {}
+        return {key: state.get(key) for key in ("picked_up", "being_held", "button_pressed", "moving")}
